@@ -1,6 +1,8 @@
 /**
- * TrafficJunky API Data Extractor for Google Sheets
+ * TrafficJunky API Data Extractor for Google Sheets - V5
  * This script pulls campaign data from TrafficJunky API and populates it into Google Sheets
+ * V5: Updated PostHog query to use person.properties.ref/source instead of URL parameters
+ *      Filters OUT header traffic (source='header')
  */
 
 // Configuration
@@ -1316,63 +1318,47 @@ function showAPIDataStructure() {
  * @returns {string} The HogQL query string
  */
 function buildPostHogQuery(startDateStr, endDateStr) {
-  // Uses ROW_NUMBER to deduplicate by email - only keeps first conversion per user
+  // V5: Updated to use person.properties.ref and filter out header traffic
+  // Deduplication done client-side in Google Apps Script
   const query = `
-WITH ranked_events AS (
-    SELECT
-        formatDateTime(toTimeZone(person.properties.first_joined_at_epoch, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS first_joined_at,
-        formatDateTime(toTimeZone(e.timestamp, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS timestamp_est,
-        person.properties.email AS user_email,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'campaign'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'Campaign'), '')
-        ) AS campaign_id,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'ClickID'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'clickid'), '')
-        ) AS click_id,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'Tracker'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'tracker'), '')
-        ) AS tracker,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'N_CLID'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'aclid'), '')
-        ) AS n_clid,
-        person.properties.$initial_referring_domain AS initial_referring_domain,
-        person.properties.$initial_current_url AS initial_current_url,
-        ROW_NUMBER() OVER (PARTITION BY person.properties.email ORDER BY e.timestamp ASC) AS row_num
-    FROM events e
-    WHERE e.event IN (
-        'sticky_subscription_activated',
-        'chargebee_subscription_created',
-        'balance_add_first_yearly_credits',
-        'balance_add_monthly_credits',
-        'upgate_subscription_activated'
-    )
-    AND toDate(toTimeZone(e.timestamp, 'America/New_York')) >= toDate('${startDateStr}')
-    AND toDate(toTimeZone(e.timestamp, 'America/New_York')) <= toDate('${endDateStr}')
-    AND (
-        person.properties.$initial_current_url LIKE '%ref=TrafficJunky%' 
-        OR person.properties.$initial_current_url LIKE '%trafficjunky%'
-        OR person.properties.$initial_referring_domain LIKE '%.youporn.%'
-        OR person.properties.$initial_referring_domain LIKE '%.pornhub.%'
-    )
-)
 SELECT
-    first_joined_at,
-    timestamp_est,
-    user_email,
-    campaign_id,
-    click_id,
-    tracker,
-    n_clid,
-    initial_referring_domain,
-    initial_current_url
-FROM ranked_events
-WHERE row_num = 1
-ORDER BY timestamp_est DESC
-LIMIT 1500;
+    formatDateTime(toTimeZone(person.properties.first_joined_at_epoch, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS first_joined_at,
+    formatDateTime(toTimeZone(e.timestamp, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS timestamp_est,
+    person.properties.email AS user_email,
+    person.properties.ref AS ref,
+    person.properties.source AS source,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'campaign'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'Campaign'), '')
+    ) AS campaign_id,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'ClickID'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'clickid'), '')
+    ) AS click_id,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'Tracker'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'tracker'), '')
+    ) AS tracker,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'N_CLID'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'aclid'), '')
+    ) AS n_clid,
+    person.properties.$initial_referring_domain AS initial_referring_domain,
+    person.properties.$initial_current_url AS initial_current_url
+FROM events e
+WHERE e.event IN (
+    'sticky_subscription_activated',
+    'chargebee_subscription_created',
+    'balance_add_first_yearly_credits',
+    'balance_add_monthly_credits',
+    'upgate_subscription_activated'
+)
+AND toDate(toTimeZone(e.timestamp, 'America/New_York')) >= toDate('${startDateStr}')
+AND toDate(toTimeZone(e.timestamp, 'America/New_York')) <= toDate('${endDateStr}')
+AND LOWER(person.properties.ref) = 'trafficjunky'
+AND (person.properties.source IS NULL OR LOWER(person.properties.source) != 'header')
+ORDER BY e.timestamp ASC
+LIMIT 2000;
   `.trim();
   
   return query;
@@ -1466,9 +1452,10 @@ function fetchPostHogConversionsSingle(startDateStr, endDateStr) {
 /**
  * Fetch PostHog conversions day by day with INCREMENTAL WRITING to sheet
  * Data appears in real-time as each day is fetched
+ * DEDUPLICATION: Only keeps first conversion per unique email (done client-side)
  */
 function fetchPostHogConversionsByDay(startDate, endDate) {
-  Logger.log(`=== Day-by-Day Fetch Starting (Incremental Write) ===`);
+  Logger.log(`=== Day-by-Day Fetch Starting (Incremental Write + Dedup) ===`);
   Logger.log(`From: ${startDate} To: ${endDate}`);
   
   // Prepare the sheet first
@@ -1491,6 +1478,8 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     'N_CLID',
     'Referring Domain',
     'Initial URL',
+    'Ref',
+    'Source',
     'Last Updated'
   ];
   
@@ -1507,15 +1496,17 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     sheet.setFrozenRows(1);
   }
   
-  SpreadsheetApp.flush(); // Show cleared sheet immediately
+  // Skip initial flush - let it happen naturally with first write
   
   let columns = null;
   const currentDate = new Date(startDate);
   let totalFetched = 0;
+  let totalFromAPI = 0;
   let daysProcessed = 0;
   let errorsEncountered = 0;
   let currentRow = 2; // Start writing from row 2
   const now = new Date();
+  const seenEmails = new Set(); // Track emails for deduplication
   
   while (currentDate <= endDate) {
     const dateStr = formatDateForDisplay(currentDate);
@@ -1534,31 +1525,58 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
         Logger.log(`  Captured columns: ${JSON.stringify(columns)}`);
       }
       
-      // IMMEDIATELY write this day's results to the sheet
+      // IMMEDIATELY write this day's results to the sheet (with deduplication by email)
       if (dayData.results && Array.isArray(dayData.results) && dayData.results.length > 0 && columns) {
         const colIndex = {};
         columns.forEach((col, idx) => { colIndex[col] = idx; });
         
-        const rows = dayData.results.map(result => [
-          result[colIndex['first_joined_at']] || '',
-          result[colIndex['timestamp_est']] || '',
-          result[colIndex['user_email']] || '',
-          result[colIndex['campaign_id']] || '',
-          result[colIndex['click_id']] || '',
-          result[colIndex['tracker']] || '',
-          result[colIndex['n_clid']] || '',
-          result[colIndex['initial_referring_domain']] || '',
-          result[colIndex['initial_current_url']] || '',
-          now
-        ]);
+        totalFromAPI += dayData.results.length;
         
-        // Write to sheet immediately
-        sheet.getRange(currentRow, 1, rows.length, headers.length).setValues(rows);
-        SpreadsheetApp.flush(); // Force display update
+        // Filter out duplicate emails (keep first occurrence)
+        const rows = [];
+        for (const result of dayData.results) {
+          const email = result[colIndex['user_email']] || '';
+          
+          // Skip if we've already seen this email
+          if (email && seenEmails.has(email)) {
+            continue;
+          }
+          
+          // Mark email as seen
+          if (email) {
+            seenEmails.add(email);
+          }
+          
+          rows.push([
+            result[colIndex['first_joined_at']] || '',
+            result[colIndex['timestamp_est']] || '',
+            email,
+            result[colIndex['campaign_id']] || '',
+            result[colIndex['click_id']] || '',
+            result[colIndex['tracker']] || '',
+            result[colIndex['n_clid']] || '',
+            result[colIndex['initial_referring_domain']] || '',
+            result[colIndex['initial_current_url']] || '',
+            result[colIndex['ref']] || '',
+            result[colIndex['source']] || '',
+            now
+          ]);
+        }
         
-        currentRow += rows.length;
-        totalFetched += dayData.results.length;
-        Logger.log(`  ✓ Wrote ${dayData.results.length} conversions for ${dateStr} (running total: ${totalFetched})`);
+        // Write to sheet immediately (only unique emails)
+        if (rows.length > 0) {
+          sheet.getRange(currentRow, 1, rows.length, headers.length).setValues(rows);
+          
+          // Only flush every 3 days to reduce overhead
+          if (daysProcessed % 3 === 0) {
+            SpreadsheetApp.flush();
+          }
+          
+          currentRow += rows.length;
+          totalFetched += rows.length;
+        }
+        
+        Logger.log(`  ✓ Wrote ${rows.length} unique conversions for ${dateStr} (${dayData.results.length} from API, running total: ${totalFetched})`);
       } else if (dayData.results && dayData.results.length === 0) {
         Logger.log(`  ⚠ No conversions for ${dateStr}`);
       } else {
@@ -1574,12 +1592,16 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     // Move to next day
     currentDate.setDate(currentDate.getDate() + 1);
     
-    // Small delay to avoid rate limiting
-    Utilities.sleep(200);
+    // Minimal delay to avoid rate limiting
+    Utilities.sleep(50);
   }
   
+  // Final flush to ensure all data is displayed
+  SpreadsheetApp.flush();
+  
   Logger.log(`=== Day-by-Day Fetch Complete ===`);
-  Logger.log(`Days processed: ${daysProcessed}, Errors: ${errorsEncountered}, Total conversions: ${totalFetched}`);
+  Logger.log(`Days processed: ${daysProcessed}, Errors: ${errorsEncountered}`);
+  Logger.log(`Total from API: ${totalFromAPI}, Unique conversions written: ${totalFetched}`);
   
   // Return summary (data already written to sheet)
   return {
@@ -1622,6 +1644,8 @@ function writeConversionsToSheet(data, startDateStr, endDateStr) {
     'N_CLID',
     'Referring Domain',
     'Initial URL',
+    'Ref',
+    'Source',
     'Last Updated'
   ];
   
@@ -1672,6 +1696,8 @@ function writeConversionsToSheet(data, startDateStr, endDateStr) {
       result[colIndex['n_clid']] || '',
       result[colIndex['initial_referring_domain']] || '',
       result[colIndex['initial_current_url']] || '',
+      result[colIndex['ref']] || '',
+      result[colIndex['source']] || '',
       now
     ];
     rows.push(row);
@@ -1930,7 +1956,7 @@ function clearConversionData() {
     if (sheet) {
       const lastRow = sheet.getLastRow();
       if (lastRow > 1) {
-        sheet.getRange(2, 1, lastRow - 1, 10).clearContent();
+        sheet.getRange(2, 1, lastRow - 1, 12).clearContent();
       }
       ui.alert('Conversion data cleared successfully.');
     } else {
@@ -2682,7 +2708,7 @@ function clearAllData() {
       if (phSheet) {
         const lastRow = phSheet.getLastRow();
         if (lastRow > 1) {
-          phSheet.getRange(2, 1, lastRow - 1, 10).clearContent();
+          phSheet.getRange(2, 1, lastRow - 1, 12).clearContent();
         }
         cleared.push('PostHog Conversions');
       }

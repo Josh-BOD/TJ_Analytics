@@ -1,11 +1,18 @@
 /**
- * TrafficJunky API Data Extractor for Google Sheets
+ * TrafficJunky API Data Extractor for Google Sheets - V7.19
  * This script pulls campaign data from TrafficJunky API and populates it into Google Sheets
+ * V7.19: **FIXED FIELD NAMES** - Updated to handle both snake_case and camelCase field names
+ *        /api/campaigns/stats.json uses snake_case (campaign_id, campaign_name, etc.)
+ * V7.18: Switched endpoint to /api/campaigns/stats.json
+ * V7.10: Added Date Range column (Q)
+ * V7.8: Added pagination with incremental writing
+ * V7.7: Added "Last 7 Days inc Today (EST)" menu option
+ * V7.6: TrafficJunky changed max limit from 1000 to 500
  */
 
 // Configuration
 const API_KEY = "9c77fe112485aff1fc1266f21994de5fabcf8df5f45886c0504494bc4ea0479156092332fc020799a6183b154b467f2bb3e2b169e4886504d83e63fe08c4f039";
-const API_URL = "https://api.trafficjunky.com/api/campaigns/bids/stats.json";
+const API_URL = "https://api.trafficjunky.com/api/campaigns/stats.json";
 const SHEET_NAME = "RAW Data - DNT"; // Aggregated campaign data sheet
 const DAILY_SHEET_NAME = "RAW_DailyData-DNT"; // Sheet for daily breakdown data
 const API_TIMEZONE = "America/New_York"; // TrafficJunky API uses EST/EDT
@@ -78,6 +85,7 @@ function onOpen() {
       .addItem('📅 Today (EST)', 'pullAllDataToday')
       .addItem('📆 Yesterday (EST)', 'pullAllDataYesterday')
       .addItem('📊 Last 7 Days (EST)', 'pullAllDataLast7Days')
+      .addItem('📊 Last 7 Days inc Today (EST)', 'pullAllDataLast7DaysIncToday')
       .addItem('📊 Last 14 Days (EST)', 'pullAllDataLast14Days')
       .addItem('📈 Last 30 Days (EST)', 'pullAllDataLast30Days')
       .addItem('📅 This Month (EST)', 'pullAllDataThisMonth')
@@ -90,6 +98,7 @@ function onOpen() {
       .addItem('📅 Today (EST)', 'pullTJToday')
       .addItem('📆 Yesterday (EST)', 'pullTJYesterday')
       .addItem('📊 Last 7 Days (EST)', 'pullLast7Days')
+      .addItem('📊 Last 7 Days inc Today (EST)', 'pullLast7DaysIncToday')
       .addItem('📊 Last 14 Days (EST)', 'pullTJLast14Days')
       .addItem('📈 Last 30 Days (EST)', 'pullTrafficJunkyData')
       .addItem('📅 This Month (EST)', 'pullThisMonth')
@@ -102,6 +111,7 @@ function onOpen() {
       .addItem('📅 Today (EST)', 'updateDailyToday')
       .addItem('📆 Yesterday (EST)', 'updateDailyYesterday')
       .addItem('📊 Last 7 Days (EST)', 'updateDailyLast7Days')
+      .addItem('📊 Last 7 Days inc Today (EST)', 'updateDailyLast7DaysIncToday')
       .addItem('📊 Last 14 Days (EST)', 'updateDailyLast14Days')
       .addItem('📈 Last 30 Days (EST)', 'updateDailyLast30Days')
       .addItem('📅 This Month (EST)', 'updateDailyThisMonth')
@@ -114,6 +124,7 @@ function onOpen() {
       .addItem('📅 Today (EST)', 'pullTodayConversions')
       .addItem('📆 Yesterday (EST)', 'pullYesterdayConversions')
       .addItem('📊 Last 7 Days (EST)', 'pullConversionsLast7Days')
+      .addItem('📊 Last 7 Days inc Today (EST)', 'pullConversionsLast7DaysIncToday')
       .addItem('📊 Last 14 Days (EST)', 'pullConversionsLast14Days')
       .addItem('📈 Last 30 Days (EST)', 'pullConversionsLast30Days')
       .addItem('📅 This Month (EST)', 'pullConversionsThisMonth')
@@ -126,6 +137,7 @@ function onOpen() {
       .addItem('📅 Today (EST)', 'pullRedTrackToday')
       .addItem('📆 Yesterday (EST)', 'pullRedTrackYesterday')
       .addItem('📊 Last 7 Days (EST)', 'pullRedTrackLast7Days')
+      .addItem('📊 Last 7 Days inc Today (EST)', 'pullRedTrackLast7DaysIncToday')
       .addItem('📊 Last 14 Days (EST)', 'pullRedTrackLast14Days')
       .addItem('📈 Last 30 Days (EST)', 'pullRedTrackLast30Days')
       .addItem('📅 This Month (EST)', 'pullRedTrackThisMonth')
@@ -172,6 +184,26 @@ function pullLast7Days() {
     
   } catch (error) {
     Logger.log("Error in pullLast7Days: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull data for last 7 days INCLUDING today
+ */
+function pullLast7DaysIncToday() {
+  try {
+    const endDate = getESTDate(); // Today
+    endDate.setHours(23, 59, 59, 999); // End of today
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 6); // 6 days before today = 7 days total
+    startDate.setHours(0, 0, 0, 0); // Start of that day
+    
+    fetchAndWriteData(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullLast7DaysIncToday: " + error.toString());
     SpreadsheetApp.getUi().alert('Error: ' + error.toString());
   }
 }
@@ -333,46 +365,160 @@ function pullCustomDateRange() {
 
 /**
  * Fetches data from TrafficJunky API and writes to sheet
+ * V7.8: Added pagination with INCREMENTAL WRITING (writes each batch as it's fetched)
  */
 function fetchAndWriteData(startDate, endDate) {
   const ui = SpreadsheetApp.getUi();
   
-  // Allow current day pulls for real-time stats (EST timezone)
-  Logger.log(`Fetching TJ data - allowing current day pulls`);
-  
-  // Show loading message
-  ui.alert('Fetching data from TrafficJunky API (EST timezone)...');
+  Logger.log(`Fetching TJ data with pagination and incremental writing`);
   
   // Format dates as DD/MM/YYYY (TrafficJunky API format)
   const formattedStartDate = formatDate(startDate);
   const formattedEndDate = formatDate(endDate);
   
-  Logger.log(`Fetching data from ${formattedStartDate} to ${formattedEndDate} (EST timezone)`);
+  // Show loading message
+  ui.alert(`Fetching data from ${formattedStartDate} to ${formattedEndDate}...\n\nData will appear in the sheet as it's fetched.`);
   
-  // Build API URL with parameters
-  const url = `${API_URL}?api_key=${API_KEY}&startDate=${formattedStartDate}&endDate=${formattedEndDate}&limit=1000&offset=1`;
+  Logger.log(`Fetching data from ${formattedStartDate} to ${formattedEndDate}`);
   
   try {
-    // Make API request
-    const response = UrlFetchApp.fetch(url, {
-      'method': 'get',
-      'contentType': 'application/json',
-      'muteHttpExceptions': true
-    });
+    // Get/create sheet and prepare it
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(SHEET_NAME);
     
-    const responseCode = response.getResponseCode();
-    
-    if (responseCode !== 200) {
-      throw new Error(`API returned status code ${responseCode}: ${response.getContentText()}`);
+    if (!sheet) {
+      Logger.log(`Sheet "${SHEET_NAME}" not found, creating new sheet`);
+      sheet = ss.insertSheet(SHEET_NAME);
     }
     
-    const jsonData = JSON.parse(response.getContentText());
-    Logger.log(`Received data for ${Object.keys(jsonData).length} campaigns`);
+    // Clear existing data (A-Q to include new Date column)
+    const lastRow = sheet.getLastRow();
+    if (lastRow > 0) {
+      sheet.getRange(1, 1, Math.max(lastRow, 1000), 17).clearContent();
+    }
     
-    // Process and write data
-    writeDataToSheet(jsonData, formattedStartDate, formattedEndDate);
+    // Write headers
+    const headers = [
+      'Campaign ID', 'Campaign Name', 'Campaign Type', 'Status',
+      'Daily Budget', 'Daily Budget Left', 'Ads Paused', 'Number of Bids',
+      'Number of Creatives', 'Impressions', 'Clicks', 'Conversions',
+      'Cost', 'CTR', 'CPM', 'Last Updated', 'Date Range'
+    ];
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
+    sheet.setFrozenRows(1);
     
-    ui.alert('Success!', 'Data has been successfully imported from TrafficJunky API.', ui.ButtonSet.OK);
+    // Pagination loop - write each batch immediately
+    // NEW APPROACH: Jump offset by 500 to avoid overlap entirely!
+    let offset = 1;
+    let hasMoreData = true;
+    let totalFetched = 0;
+    let totalWritten = 0;
+    let currentRow = 2; // Start writing data at row 2 (after headers)
+    const limit = 500;
+    
+    while (hasMoreData) {
+      Logger.log(`Fetching batch with offset=${offset}`);
+      
+      // Build API URL with pagination
+      const url = `${API_URL}?api_key=${API_KEY}&startDate=${formattedStartDate}&endDate=${formattedEndDate}&limit=${limit}&offset=${offset}`;
+      
+      // Make API request
+      const response = UrlFetchApp.fetch(url, {
+        'method': 'get',
+        'contentType': 'application/json',
+        'muteHttpExceptions': true
+      });
+      
+      const responseCode = response.getResponseCode();
+      
+      if (responseCode !== 200) {
+        const rawResponse = response.getContentText();
+        throw new Error(`API returned status code ${responseCode}: ${rawResponse}`);
+      }
+      
+      const jsonData = JSON.parse(response.getContentText());
+      
+      // Check for API error messages
+      if (jsonData && jsonData.message && typeof jsonData.message === 'string') {
+        Logger.log(`⚠️ API RETURNED ERROR MESSAGE: ${jsonData.message}`);
+        throw new Error(`TrafficJunky API Error: ${jsonData.message}`);
+      }
+      
+      // Convert batch to campaigns array
+      let campaigns = [];
+      if (Array.isArray(jsonData)) {
+        campaigns = jsonData;
+      } else if (typeof jsonData === 'object' && jsonData !== null) {
+        campaigns = Object.values(jsonData);
+      }
+      
+      const batchCount = campaigns.length;
+      totalFetched += batchCount;
+      Logger.log(`Batch at offset ${offset}: Received ${batchCount} campaigns (Total so far: ${totalFetched})`);
+      
+      // Convert campaigns to rows - NO deduplication needed with proper offset jumps!
+      const rows = [];
+      
+      for (let campaign of campaigns) {
+        if (campaign && typeof campaign === 'object') {
+          const row = [
+            campaign.campaign_id || campaign.campaignId || campaign.id || 'unknown',
+            campaign.campaign_name || campaign.campaignName || '',
+            campaign.campaign_type || campaign.campaignType || '',
+            campaign.status || '',
+            toNumeric(campaign.campaign_daily_budget || campaign.dailyBudget, 0),
+            toNumeric(campaign.daily_budget_left || campaign.dailyBudgetLeft, 0),
+            toNumeric(campaign.paused_ads || campaign.adsPaused, 0),
+            toNumeric(campaign.number_of_bids || campaign.numberOfBids, 0),
+            toNumeric(campaign.number_of_creatives || campaign.numberOfCreative, 0),
+            toNumeric(campaign.impressions, 0),
+            toNumeric(campaign.clicks, 0),
+            toNumeric(campaign.conversions, 0),
+            toNumeric(campaign.cost, 0),
+            toNumeric(campaign.CTR || campaign.ctr, 0),
+            toNumeric(campaign.CPM || campaign.cpm, 0),
+            new Date(),
+            `${formattedStartDate} to ${formattedEndDate}` // Date range column
+          ];
+          rows.push(row);
+        }
+      }
+      
+      Logger.log(`  → Writing ${rows.length} campaigns`);
+      totalWritten += rows.length;
+      
+      // Write this batch to sheet immediately
+      if (rows.length > 0) {
+        sheet.getRange(currentRow, 1, rows.length, headers.length).setValues(rows);
+        Logger.log(`✓ Wrote ${rows.length} rows to sheet (rows ${currentRow}-${currentRow + rows.length - 1})`);
+        currentRow += rows.length;
+        
+        // Flush changes to make them visible
+        SpreadsheetApp.flush();
+      }
+      
+      // Stop if we got less than limit campaigns (end of data)
+      if (batchCount < limit) {
+        hasMoreData = false;
+        Logger.log(`Received less than ${limit} campaigns, stopping pagination`);
+      } else {
+        offset += limit; // Jump by 500! (offset = 1, 501, 1001, 1501...)
+      }
+      
+      // Safety limit: Stop after 10 pages (5,000 campaigns)
+      if (offset > 5000) {
+        Logger.log(`⚠️ Reached safety limit - stopping to prevent timeout`);
+        hasMoreData = false;
+      }
+    }
+    
+    Logger.log(`✅ Pagination complete: Total ${totalFetched} campaigns fetched, ${totalWritten} campaigns written`);
+    
+    // Skip formatting to avoid timeout - data is already written!
+    // User can format manually if needed
+    
+    ui.alert('Success!', `Data imported from ${formattedStartDate} to ${formattedEndDate}\n\nCampaigns: ${totalWritten}\nTotal fetched: ${totalFetched}`, ui.ButtonSet.OK);
     
   } catch (error) {
     Logger.log("Error fetching data: " + error.toString());
@@ -449,8 +595,27 @@ function writeDataToSheet(apiData, startDate, endDate) {
   
   Logger.log(`Processing ${campaigns.length} campaigns...`);
   
-  // Convert campaigns to rows
-  for (let campaign of campaigns) {
+  // Convert campaigns to rows - V7 ENHANCED with debugging
+  for (let i = 0; i < campaigns.length; i++) {
+    const campaign = campaigns[i];
+    
+    // DEBUG: Log first campaign in detail
+    if (i === 0) {
+      Logger.log(`=== FIRST CAMPAIGN DEBUG ===`);
+      Logger.log(`Type: ${typeof campaign}`);
+      Logger.log(`Is null: ${campaign === null}`);
+      Logger.log(`Is undefined: ${campaign === undefined}`);
+      
+      if (campaign && typeof campaign === 'object') {
+        Logger.log(`Keys: ${Object.keys(campaign).join(', ')}`);
+        Logger.log(`Sample JSON: ${JSON.stringify(campaign).substring(0, 300)}...`);
+        Logger.log(`campaignId: ${campaign.campaignId}`);
+        Logger.log(`id: ${campaign.id}`);
+        Logger.log(`campaignName: ${campaign.campaignName}`);
+      }
+      Logger.log(`=== END DEBUG ===`);
+    }
+    
     if (campaign && typeof campaign === 'object') {
       const row = [
         campaign.campaignId || campaign.id || 'unknown',
@@ -471,6 +636,13 @@ function writeDataToSheet(apiData, startDate, endDate) {
         new Date()
       ];
       rows.push(row);
+      
+      // Log first successful row
+      if (rows.length === 1) {
+        Logger.log(`✓ First row created successfully with ${row.length} columns`);
+      }
+    } else {
+      Logger.log(`✗ Campaign ${i} SKIPPED - type: ${typeof campaign}, null: ${campaign === null}, undef: ${campaign === undefined}`);
     }
   }
   
@@ -599,6 +771,26 @@ function updateDailyLast7Days() {
     
   } catch (error) {
     Logger.log("Error in updateDailyLast7Days: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Update daily data for last 7 days INCLUDING today
+ */
+function updateDailyLast7DaysIncToday() {
+  try {
+    const endDate = getESTDate(); // Today
+    endDate.setHours(23, 59, 59, 999);
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 6); // 6 days before today = 7 days total
+    startDate.setHours(0, 0, 0, 0);
+    
+    updateDailyData(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in updateDailyLast7DaysIncToday: " + error.toString());
     SpreadsheetApp.getUi().alert('Error: ' + error.toString());
   }
 }
@@ -1316,63 +1508,47 @@ function showAPIDataStructure() {
  * @returns {string} The HogQL query string
  */
 function buildPostHogQuery(startDateStr, endDateStr) {
-  // Uses ROW_NUMBER to deduplicate by email - only keeps first conversion per user
+  // V5: Updated to use person.properties.ref and filter out header traffic
+  // Deduplication done client-side in Google Apps Script
   const query = `
-WITH ranked_events AS (
-    SELECT
-        formatDateTime(toTimeZone(person.properties.first_joined_at_epoch, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS first_joined_at,
-        formatDateTime(toTimeZone(e.timestamp, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS timestamp_est,
-        person.properties.email AS user_email,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'campaign'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'Campaign'), '')
-        ) AS campaign_id,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'ClickID'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'clickid'), '')
-        ) AS click_id,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'Tracker'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'tracker'), '')
-        ) AS tracker,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'N_CLID'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'aclid'), '')
-        ) AS n_clid,
-        person.properties.$initial_referring_domain AS initial_referring_domain,
-        person.properties.$initial_current_url AS initial_current_url,
-        ROW_NUMBER() OVER (PARTITION BY person.properties.email ORDER BY e.timestamp ASC) AS row_num
-    FROM events e
-    WHERE e.event IN (
-        'sticky_subscription_activated',
-        'chargebee_subscription_created',
-        'balance_add_first_yearly_credits',
-        'balance_add_monthly_credits',
-        'upgate_subscription_activated'
-    )
-    AND toDate(toTimeZone(e.timestamp, 'America/New_York')) >= toDate('${startDateStr}')
-    AND toDate(toTimeZone(e.timestamp, 'America/New_York')) <= toDate('${endDateStr}')
-    AND (
-        person.properties.$initial_current_url LIKE '%ref=TrafficJunky%' 
-        OR person.properties.$initial_current_url LIKE '%trafficjunky%'
-        OR person.properties.$initial_referring_domain LIKE '%.youporn.%'
-        OR person.properties.$initial_referring_domain LIKE '%.pornhub.%'
-    )
-)
 SELECT
-    first_joined_at,
-    timestamp_est,
-    user_email,
-    campaign_id,
-    click_id,
-    tracker,
-    n_clid,
-    initial_referring_domain,
-    initial_current_url
-FROM ranked_events
-WHERE row_num = 1
-ORDER BY timestamp_est DESC
-LIMIT 1500;
+    formatDateTime(toTimeZone(person.properties.first_joined_at_epoch, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS first_joined_at,
+    formatDateTime(toTimeZone(e.timestamp, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS timestamp_est,
+    person.properties.email AS user_email,
+    person.properties.ref AS ref,
+    person.properties.source AS source,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'campaign'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'Campaign'), '')
+    ) AS campaign_id,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'ClickID'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'clickid'), '')
+    ) AS click_id,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'Tracker'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'tracker'), '')
+    ) AS tracker,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'N_CLID'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'aclid'), '')
+    ) AS n_clid,
+    person.properties.$initial_referring_domain AS initial_referring_domain,
+    person.properties.$initial_current_url AS initial_current_url
+FROM events e
+WHERE e.event IN (
+    'sticky_subscription_activated',
+    'chargebee_subscription_created',
+    'balance_add_first_yearly_credits',
+    'balance_add_monthly_credits',
+    'upgate_subscription_activated'
+)
+AND toDate(toTimeZone(e.timestamp, 'America/New_York')) >= toDate('${startDateStr}')
+AND toDate(toTimeZone(e.timestamp, 'America/New_York')) <= toDate('${endDateStr}')
+AND LOWER(person.properties.ref) = 'trafficjunky'
+AND (person.properties.source IS NULL OR LOWER(person.properties.source) != 'header')
+ORDER BY e.timestamp ASC
+LIMIT 2000;
   `.trim();
   
   return query;
@@ -1466,9 +1642,10 @@ function fetchPostHogConversionsSingle(startDateStr, endDateStr) {
 /**
  * Fetch PostHog conversions day by day with INCREMENTAL WRITING to sheet
  * Data appears in real-time as each day is fetched
+ * DEDUPLICATION: Only keeps first conversion per unique email (done client-side)
  */
 function fetchPostHogConversionsByDay(startDate, endDate) {
-  Logger.log(`=== Day-by-Day Fetch Starting (Incremental Write) ===`);
+  Logger.log(`=== Day-by-Day Fetch Starting (Incremental Write + Dedup) ===`);
   Logger.log(`From: ${startDate} To: ${endDate}`);
   
   // Prepare the sheet first
@@ -1491,6 +1668,8 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     'N_CLID',
     'Referring Domain',
     'Initial URL',
+    'Ref',
+    'Source',
     'Last Updated'
   ];
   
@@ -1507,15 +1686,17 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     sheet.setFrozenRows(1);
   }
   
-  SpreadsheetApp.flush(); // Show cleared sheet immediately
+  // Skip initial flush - let it happen naturally with first write
   
   let columns = null;
   const currentDate = new Date(startDate);
   let totalFetched = 0;
+  let totalFromAPI = 0;
   let daysProcessed = 0;
   let errorsEncountered = 0;
   let currentRow = 2; // Start writing from row 2
   const now = new Date();
+  const seenEmails = new Set(); // Track emails for deduplication
   
   while (currentDate <= endDate) {
     const dateStr = formatDateForDisplay(currentDate);
@@ -1534,31 +1715,58 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
         Logger.log(`  Captured columns: ${JSON.stringify(columns)}`);
       }
       
-      // IMMEDIATELY write this day's results to the sheet
+      // IMMEDIATELY write this day's results to the sheet (with deduplication by email)
       if (dayData.results && Array.isArray(dayData.results) && dayData.results.length > 0 && columns) {
         const colIndex = {};
         columns.forEach((col, idx) => { colIndex[col] = idx; });
         
-        const rows = dayData.results.map(result => [
-          result[colIndex['first_joined_at']] || '',
-          result[colIndex['timestamp_est']] || '',
-          result[colIndex['user_email']] || '',
-          result[colIndex['campaign_id']] || '',
-          result[colIndex['click_id']] || '',
-          result[colIndex['tracker']] || '',
-          result[colIndex['n_clid']] || '',
-          result[colIndex['initial_referring_domain']] || '',
-          result[colIndex['initial_current_url']] || '',
-          now
-        ]);
+        totalFromAPI += dayData.results.length;
         
-        // Write to sheet immediately
-        sheet.getRange(currentRow, 1, rows.length, headers.length).setValues(rows);
-        SpreadsheetApp.flush(); // Force display update
+        // Filter out duplicate emails (keep first occurrence)
+        const rows = [];
+        for (const result of dayData.results) {
+          const email = result[colIndex['user_email']] || '';
+          
+          // Skip if we've already seen this email
+          if (email && seenEmails.has(email)) {
+            continue;
+          }
+          
+          // Mark email as seen
+          if (email) {
+            seenEmails.add(email);
+          }
+          
+          rows.push([
+            result[colIndex['first_joined_at']] || '',
+            result[colIndex['timestamp_est']] || '',
+            email,
+            result[colIndex['campaign_id']] || '',
+            result[colIndex['click_id']] || '',
+            result[colIndex['tracker']] || '',
+            result[colIndex['n_clid']] || '',
+            result[colIndex['initial_referring_domain']] || '',
+            result[colIndex['initial_current_url']] || '',
+            result[colIndex['ref']] || '',
+            result[colIndex['source']] || '',
+            now
+          ]);
+        }
         
-        currentRow += rows.length;
-        totalFetched += dayData.results.length;
-        Logger.log(`  ✓ Wrote ${dayData.results.length} conversions for ${dateStr} (running total: ${totalFetched})`);
+        // Write to sheet immediately (only unique emails)
+        if (rows.length > 0) {
+          sheet.getRange(currentRow, 1, rows.length, headers.length).setValues(rows);
+          
+          // Only flush every 3 days to reduce overhead
+          if (daysProcessed % 3 === 0) {
+            SpreadsheetApp.flush();
+          }
+          
+          currentRow += rows.length;
+          totalFetched += rows.length;
+        }
+        
+        Logger.log(`  ✓ Wrote ${rows.length} unique conversions for ${dateStr} (${dayData.results.length} from API, running total: ${totalFetched})`);
       } else if (dayData.results && dayData.results.length === 0) {
         Logger.log(`  ⚠ No conversions for ${dateStr}`);
       } else {
@@ -1574,12 +1782,16 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     // Move to next day
     currentDate.setDate(currentDate.getDate() + 1);
     
-    // Small delay to avoid rate limiting
-    Utilities.sleep(200);
+    // Minimal delay to avoid rate limiting
+    Utilities.sleep(50);
   }
   
+  // Final flush to ensure all data is displayed
+  SpreadsheetApp.flush();
+  
   Logger.log(`=== Day-by-Day Fetch Complete ===`);
-  Logger.log(`Days processed: ${daysProcessed}, Errors: ${errorsEncountered}, Total conversions: ${totalFetched}`);
+  Logger.log(`Days processed: ${daysProcessed}, Errors: ${errorsEncountered}`);
+  Logger.log(`Total from API: ${totalFromAPI}, Unique conversions written: ${totalFetched}`);
   
   // Return summary (data already written to sheet)
   return {
@@ -1622,6 +1834,8 @@ function writeConversionsToSheet(data, startDateStr, endDateStr) {
     'N_CLID',
     'Referring Domain',
     'Initial URL',
+    'Ref',
+    'Source',
     'Last Updated'
   ];
   
@@ -1672,6 +1886,8 @@ function writeConversionsToSheet(data, startDateStr, endDateStr) {
       result[colIndex['n_clid']] || '',
       result[colIndex['initial_referring_domain']] || '',
       result[colIndex['initial_current_url']] || '',
+      result[colIndex['ref']] || '',
+      result[colIndex['source']] || '',
       now
     ];
     rows.push(row);
@@ -1785,6 +2001,26 @@ function pullConversionsLast7Days() {
     
   } catch (error) {
     Logger.log("Error in pullConversionsLast7Days: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull PostHog conversions for last 7 days INCLUDING today
+ */
+function pullConversionsLast7DaysIncToday() {
+  try {
+    const endDate = getESTDate(); // Today
+    endDate.setHours(23, 59, 59, 999); // End of today
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 6); // 6 days before today = 7 days total
+    startDate.setHours(0, 0, 0, 0);
+    
+    fetchAndWriteConversions(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullConversionsLast7DaysIncToday: " + error.toString());
     SpreadsheetApp.getUi().alert('Error: ' + error.toString());
   }
 }
@@ -1930,7 +2166,7 @@ function clearConversionData() {
     if (sheet) {
       const lastRow = sheet.getLastRow();
       if (lastRow > 1) {
-        sheet.getRange(2, 1, lastRow - 1, 10).clearContent();
+        sheet.getRange(2, 1, lastRow - 1, 12).clearContent();
       }
       ui.alert('Conversion data cleared successfully.');
     } else {
@@ -2224,6 +2460,26 @@ function pullRedTrackLast7Days() {
 }
 
 /**
+ * Pull RedTrack conversions for last 7 days INCLUDING today
+ */
+function pullRedTrackLast7DaysIncToday() {
+  try {
+    const endDate = getESTDate(); // Today
+    endDate.setHours(23, 59, 59, 999); // End of today
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 6); // 6 days before today = 7 days total
+    startDate.setHours(0, 0, 0, 0);
+    
+    fetchAndWriteRedTrack(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullRedTrackLast7DaysIncToday: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
  * Pull last 30 days of RedTrack conversions
  */
 function pullRedTrackLast30Days() {
@@ -2505,6 +2761,26 @@ function pullAllDataLast7Days() {
 }
 
 /**
+ * Pull all data sources for last 7 days INCLUDING today
+ */
+function pullAllDataLast7DaysIncToday() {
+  try {
+    const endDate = getESTDate(); // Today
+    endDate.setHours(23, 59, 59, 999); // End of today
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 6); // 6 days before today = 7 days total
+    startDate.setHours(0, 0, 0, 0);
+    
+    fetchAllData(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullAllDataLast7DaysIncToday: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
  * Pull all data for last 30 days
  */
 function pullAllDataLast30Days() {
@@ -2682,7 +2958,7 @@ function clearAllData() {
       if (phSheet) {
         const lastRow = phSheet.getLastRow();
         if (lastRow > 1) {
-          phSheet.getRange(2, 1, lastRow - 1, 10).clearContent();
+          phSheet.getRange(2, 1, lastRow - 1, 12).clearContent();
         }
         cleared.push('PostHog Conversions');
       }

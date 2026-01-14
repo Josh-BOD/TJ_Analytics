@@ -1,6 +1,10 @@
 /**
- * TrafficJunky API Data Extractor for Google Sheets
+ * TrafficJunky API Data Extractor for Google Sheets - V6
  * This script pulls campaign data from TrafficJunky API and populates it into Google Sheets
+ * V6: Added creative/ad data fetching using /api/ads/{campaignId}.json endpoint
+ *      Creatives stored in separate Creative_Data sheet with full ad details
+ * V5: Updated PostHog query to use person.properties.ref/source instead of URL parameters
+ *      Filters OUT header traffic (source='header')
  */
 
 // Configuration
@@ -8,6 +12,7 @@ const API_KEY = "9c77fe112485aff1fc1266f21994de5fabcf8df5f45886c0504494bc4ea0479
 const API_URL = "https://api.trafficjunky.com/api/campaigns/bids/stats.json";
 const SHEET_NAME = "RAW Data - DNT"; // Aggregated campaign data sheet
 const DAILY_SHEET_NAME = "RAW_DailyData-DNT"; // Sheet for daily breakdown data
+const CREATIVES_SHEET_NAME = "Creative_Data"; // Sheet for creative/ad data
 const API_TIMEZONE = "America/New_York"; // TrafficJunky API uses EST/EDT
 
 // PostHog Configuration
@@ -134,6 +139,18 @@ function onOpen() {
       .addItem('🔧 Custom Date Range (EST)', 'pullRedTrackCustomRange')
       .addSeparator()
       .addItem('🗑️ Clear RedTrack Data', 'clearRedTrackData'))
+    .addSubMenu(ui.createMenu('🎨 Creative/Ad Data')
+      .addItem('📅 Today (EST)', 'pullCreativesToday')
+      .addItem('📆 Yesterday (EST)', 'pullCreativesYesterday')
+      .addItem('📊 Last 7 Days (EST)', 'pullCreativesLast7Days')
+      .addItem('📊 Last 14 Days (EST)', 'pullCreativesLast14Days')
+      .addItem('📈 Last 30 Days (EST)', 'pullCreativesLast30Days')
+      .addItem('📅 This Month (EST)', 'pullCreativesThisMonth')
+      .addItem('📅 Last Month (EST)', 'pullCreativesLastMonth')
+      .addSeparator()
+      .addItem('🔧 Custom Date Range (EST)', 'pullCreativesCustomRange')
+      .addSeparator()
+      .addItem('🗑️ Clear Creative Data', 'clearCreativeData'))
     .addSeparator()
     .addItem('🔍 Show API Data Structure', 'showAPIDataStructure')
     .addToUi();
@@ -1305,6 +1322,444 @@ function showAPIDataStructure() {
 }
 
 // ============================================================================
+// CREATIVE/AD DATA FUNCTIONS
+// ============================================================================
+
+/**
+ * Gets campaign IDs from the specified date range
+ * Fetches fresh data to get current list of campaigns
+ * @param {Date} startDate - Start date
+ * @param {Date} endDate - End date
+ * @returns {Array} Array of objects with {id, name} for each campaign
+ */
+function getCampaignIdsForDateRange(startDate, endDate) {
+  // Fetch fresh campaign data
+  const formattedStartDate = formatDate(startDate);
+  const formattedEndDate = formatDate(endDate);
+  
+  const url = `${API_URL}?api_key=${API_KEY}&startDate=${formattedStartDate}&endDate=${formattedEndDate}&limit=1000&offset=1`;
+  
+  try {
+    const response = UrlFetchApp.fetch(url, {
+      'method': 'get',
+      'contentType': 'application/json',
+      'muteHttpExceptions': true
+    });
+    
+    if (response.getResponseCode() !== 200) {
+      Logger.log(`Failed to get campaigns: ${response.getResponseCode()}`);
+      return [];
+    }
+    
+    const jsonData = JSON.parse(response.getContentText());
+    const campaigns = Array.isArray(jsonData) ? jsonData : Object.values(jsonData);
+    
+    Logger.log(`Found ${campaigns.length} campaigns for date range`);
+    
+    return campaigns.map(c => ({
+      id: c.campaignId || c.id,
+      name: c.campaignName || ''
+    }));
+    
+  } catch (error) {
+    Logger.log(`Error getting campaign IDs: ${error.toString()}`);
+    return [];
+  }
+}
+
+/**
+ * Processes the creative API response into rows
+ * ENHANCED: Now captures performance metrics if available
+ * @param {Object|Array} data - API response data
+ * @param {string} campaignId - Campaign ID
+ * @param {string} campaignName - Campaign name
+ * @returns {Array} Array of rows ready for sheet writing
+ */
+function processCreativeResponse(data, campaignId, campaignName) {
+  const rows = [];
+  const now = new Date();
+  
+  // Handle different response formats
+  let creatives = [];
+  if (Array.isArray(data)) {
+    creatives = data;
+  } else if (data && data.ads && Array.isArray(data.ads)) {
+    creatives = data.ads;
+  } else if (data && data.creatives && Array.isArray(data.creatives)) {
+    creatives = data.creatives;
+  } else if (data && typeof data === 'object') {
+    // Could be object with creative IDs as keys
+    creatives = Object.values(data);
+  }
+  
+  for (let creative of creatives) {
+    if (creative && typeof creative === 'object') {
+      rows.push([
+        campaignId,
+        campaignName,
+        creative.id || creative.creativeId || creative.adId || '',
+        creative.name || creative.creativeName || creative.title || '',
+        creative.type || creative.creativeType || creative.adType || '',
+        creative.status || creative.state || '',
+        // PERFORMANCE METRICS (if available in API response)
+        toNumeric(creative.impressions, 0),
+        toNumeric(creative.clicks, 0),
+        toNumeric(creative.conversions, 0),
+        toNumeric(creative.cost, 0),
+        toNumeric(creative.CTR, 0),
+        toNumeric(creative.CPM, 0),
+        // METADATA
+        creative.url || creative.creativeUrl || creative.path || '',
+        creative.thumbnail || creative.thumbnailUrl || creative.thumb || '',
+        toNumeric(creative.width, 0),
+        toNumeric(creative.height, 0),
+        toNumeric(creative.fileSize || creative.size, 0),
+        creative.createdAt || creative.dateCreated || creative.created || '',
+        now
+      ]);
+    }
+  }
+  
+  return rows;
+}
+
+/**
+ * Fetches creative data for all campaigns in date range
+ * @param {Date} startDate - Start date
+ * @param {Date} endDate - End date
+ */
+function fetchAndWriteCreatives(startDate, endDate) {
+  const ui = SpreadsheetApp.getUi();
+  const ss = SpreadsheetApp.getActiveSpreadsheet();
+  
+  ui.alert('Fetching creative data from TrafficJunky API...');
+  
+  // Step 1: Get list of campaign IDs from aggregated data
+  const campaignIds = getCampaignIdsForDateRange(startDate, endDate);
+  
+  if (campaignIds.length === 0) {
+    ui.alert('No campaigns found for the specified date range.');
+    return;
+  }
+  
+  Logger.log(`Fetching creatives for ${campaignIds.length} campaigns`);
+  
+  // Step 2: Prepare creative sheet
+  let sheet = ss.getSheetByName(CREATIVES_SHEET_NAME);
+  if (!sheet) {
+    sheet = ss.insertSheet(CREATIVES_SHEET_NAME);
+  }
+  
+  // Headers - PERFORMANCE METRICS FIRST for easier analysis
+  const headers = [
+    'Campaign ID',
+    'Campaign Name',
+    'Creative ID',
+    'Creative Name',
+    'Creative Type',
+    'Status',
+    'Impressions',
+    'Clicks',
+    'Conversions',
+    'Cost',
+    'CTR',
+    'CPM',
+    'Creative URL',
+    'Thumbnail URL',
+    'Width',
+    'Height',
+    'File Size',
+    'Date Created',
+    'Last Updated'
+  ];
+  
+  // Clear and write headers
+  const lastRow = sheet.getLastRow();
+  if (lastRow > 1) {
+    sheet.getRange(2, 1, lastRow - 1, headers.length).clearContent();
+  }
+  
+  if (lastRow === 0 || sheet.getRange(1, 1).getValue() !== headers[0]) {
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold')
+      .setBackground('#ea4335').setFontColor('white');
+    sheet.setFrozenRows(1);
+  }
+  
+  // Step 3: Fetch creatives for each campaign
+  const allCreatives = [];
+  let successCount = 0;
+  let errorCount = 0;
+  
+  for (let i = 0; i < campaignIds.length; i++) {
+    const campaignId = campaignIds[i].id;
+    const campaignName = campaignIds[i].name;
+    
+    Logger.log(`Fetching creatives for campaign ${i+1}/${campaignIds.length}: ${campaignId} - ${campaignName}`);
+    
+    try {
+      const url = `https://api.trafficjunky.com/api/ads/${campaignId}.json?api_key=${API_KEY}`;
+      
+      const response = UrlFetchApp.fetch(url, {
+        'method': 'get',
+        'contentType': 'application/json',
+        'muteHttpExceptions': true
+      });
+      
+      const responseCode = response.getResponseCode();
+      
+      if (responseCode === 200) {
+        const data = JSON.parse(response.getContentText());
+        const creatives = processCreativeResponse(data, campaignId, campaignName);
+        allCreatives.push(...creatives);
+        successCount++;
+        Logger.log(`  ✓ Found ${creatives.length} creatives`);
+      } else {
+        Logger.log(`  ✗ Error ${responseCode} for campaign ${campaignId}`);
+        errorCount++;
+      }
+      
+    } catch (error) {
+      Logger.log(`  ✗ Exception for campaign ${campaignId}: ${error.toString()}`);
+      errorCount++;
+    }
+    
+    // Rate limit delay
+    if (i < campaignIds.length - 1) {
+      Utilities.sleep(100);
+    }
+  }
+  
+  // Step 4: Write creative data to sheet
+  if (allCreatives.length > 0) {
+    sheet.getRange(2, 1, allCreatives.length, headers.length).setValues(allCreatives);
+    
+    // Format PERFORMANCE columns
+    sheet.getRange(2, 7, allCreatives.length, 1).setNumberFormat('#,##0'); // Impressions
+    sheet.getRange(2, 8, allCreatives.length, 1).setNumberFormat('#,##0'); // Clicks
+    sheet.getRange(2, 9, allCreatives.length, 1).setNumberFormat('#,##0'); // Conversions
+    sheet.getRange(2, 10, allCreatives.length, 1).setNumberFormat('$#,##0.00'); // Cost
+    sheet.getRange(2, 11, allCreatives.length, 1).setNumberFormat('0.00'); // CTR
+    sheet.getRange(2, 12, allCreatives.length, 1).setNumberFormat('$#,##0.00'); // CPM
+    
+    // Format METADATA columns
+    sheet.getRange(2, 15, allCreatives.length, 2).setNumberFormat('#,##0'); // Width, Height
+    sheet.getRange(2, 17, allCreatives.length, 1).setNumberFormat('#,##0'); // File Size
+    sheet.getRange(2, 18, allCreatives.length, 2).setNumberFormat('yyyy-mm-dd hh:mm:ss'); // Dates
+    
+    sheet.autoResizeColumns(1, headers.length);
+    
+    Logger.log(`Successfully wrote ${allCreatives.length} creatives to sheet`);
+  }
+  
+  ui.alert('Success!', 
+    `Fetched creatives from ${successCount} campaigns.\n` +
+    `Total creatives: ${allCreatives.length}\n` +
+    `Errors: ${errorCount}`,
+    ui.ButtonSet.OK);
+}
+
+/**
+ * Pull creative data for today (EST)
+ */
+function pullCreativesToday() {
+  try {
+    const today = getESTDate();
+    today.setHours(0, 0, 0, 0);
+    
+    fetchAndWriteCreatives(today, today);
+    
+  } catch (error) {
+    Logger.log("Error in pullCreativesToday: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull creative data for yesterday (EST)
+ */
+function pullCreativesYesterday() {
+  try {
+    const yesterday = getESTYesterday();
+    
+    fetchAndWriteCreatives(yesterday, yesterday);
+    
+  } catch (error) {
+    Logger.log("Error in pullCreativesYesterday: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull creative data for last 7 days
+ */
+function pullCreativesLast7Days() {
+  try {
+    const endDate = getESTDate();
+    endDate.setHours(0, 0, 0, 0);
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 6);
+    
+    fetchAndWriteCreatives(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullCreativesLast7Days: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull creative data for last 14 days
+ */
+function pullCreativesLast14Days() {
+  try {
+    const endDate = getESTDate();
+    endDate.setHours(0, 0, 0, 0);
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 13);
+    
+    fetchAndWriteCreatives(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullCreativesLast14Days: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull creative data for last 30 days
+ */
+function pullCreativesLast30Days() {
+  try {
+    const endDate = getESTDate();
+    endDate.setHours(0, 0, 0, 0);
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 29);
+    
+    fetchAndWriteCreatives(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullCreativesLast30Days: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull creative data for this month
+ */
+function pullCreativesThisMonth() {
+  try {
+    const endDate = getESTDate();
+    endDate.setHours(0, 0, 0, 0);
+    
+    const startDate = getESTFirstOfMonth();
+    
+    fetchAndWriteCreatives(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullCreativesThisMonth: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull creative data for last month
+ */
+function pullCreativesLastMonth() {
+  try {
+    const startDate = getESTFirstOfLastMonth();
+    const endDate = getESTLastOfLastMonth();
+    
+    fetchAndWriteCreatives(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullCreativesLastMonth: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull creative data for custom date range
+ */
+function pullCreativesCustomRange() {
+  const ui = SpreadsheetApp.getUi();
+  
+  // Prompt for start date
+  const startDateResponse = ui.prompt(
+    'Start Date (EST)',
+    'Enter start date (YYYY-MM-DD):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  
+  if (startDateResponse.getSelectedButton() !== ui.Button.OK) {
+    return;
+  }
+  
+  // Prompt for end date
+  const endDateResponse = ui.prompt(
+    'End Date (EST)',
+    'Enter end date (YYYY-MM-DD):',
+    ui.ButtonSet.OK_CANCEL
+  );
+  
+  if (endDateResponse.getSelectedButton() !== ui.Button.OK) {
+    return;
+  }
+  
+  try {
+    let startDate = new Date(startDateResponse.getResponseText());
+    let endDate = new Date(endDateResponse.getResponseText());
+    
+    if (isNaN(startDate.getTime()) || isNaN(endDate.getTime())) {
+      ui.alert('Invalid date format. Please use YYYY-MM-DD format.');
+      return;
+    }
+    
+    // Validate dates
+    if (startDate > endDate) {
+      ui.alert('Error: Start date cannot be after end date.');
+      return;
+    }
+    
+    fetchAndWriteCreatives(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullCreativesCustomRange: " + error.toString());
+    ui.alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Clear creative data from the Creative_Data sheet
+ */
+function clearCreativeData() {
+  const ui = SpreadsheetApp.getUi();
+  const result = ui.alert(
+    'Clear Creative Data',
+    'Are you sure you want to clear all creative/ad data?',
+    ui.ButtonSet.YES_NO
+  );
+  
+  if (result === ui.Button.YES) {
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    const sheet = ss.getSheetByName(CREATIVES_SHEET_NAME);
+    
+    if (sheet) {
+      const lastRow = sheet.getLastRow();
+      if (lastRow > 1) {
+        sheet.getRange(2, 1, lastRow - 1, 19).clearContent();
+      }
+      ui.alert('Creative data cleared successfully.');
+    } else {
+      ui.alert('Creative data sheet not found.');
+    }
+  }
+}
+
+// ============================================================================
 // POSTHOG CONVERSIONS FUNCTIONS
 // ============================================================================
 
@@ -1316,63 +1771,47 @@ function showAPIDataStructure() {
  * @returns {string} The HogQL query string
  */
 function buildPostHogQuery(startDateStr, endDateStr) {
-  // Uses ROW_NUMBER to deduplicate by email - only keeps first conversion per user
+  // V5: Updated to use person.properties.ref and filter out header traffic
+  // Deduplication done client-side in Google Apps Script
   const query = `
-WITH ranked_events AS (
-    SELECT
-        formatDateTime(toTimeZone(person.properties.first_joined_at_epoch, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS first_joined_at,
-        formatDateTime(toTimeZone(e.timestamp, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS timestamp_est,
-        person.properties.email AS user_email,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'campaign'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'Campaign'), '')
-        ) AS campaign_id,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'ClickID'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'clickid'), '')
-        ) AS click_id,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'Tracker'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'tracker'), '')
-        ) AS tracker,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'N_CLID'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'aclid'), '')
-        ) AS n_clid,
-        person.properties.$initial_referring_domain AS initial_referring_domain,
-        person.properties.$initial_current_url AS initial_current_url,
-        ROW_NUMBER() OVER (PARTITION BY person.properties.email ORDER BY e.timestamp ASC) AS row_num
-    FROM events e
-    WHERE e.event IN (
-        'sticky_subscription_activated',
-        'chargebee_subscription_created',
-        'balance_add_first_yearly_credits',
-        'balance_add_monthly_credits',
-        'upgate_subscription_activated'
-    )
-    AND toDate(toTimeZone(e.timestamp, 'America/New_York')) >= toDate('${startDateStr}')
-    AND toDate(toTimeZone(e.timestamp, 'America/New_York')) <= toDate('${endDateStr}')
-    AND (
-        person.properties.$initial_current_url LIKE '%ref=TrafficJunky%' 
-        OR person.properties.$initial_current_url LIKE '%trafficjunky%'
-        OR person.properties.$initial_referring_domain LIKE '%.youporn.%'
-        OR person.properties.$initial_referring_domain LIKE '%.pornhub.%'
-    )
-)
 SELECT
-    first_joined_at,
-    timestamp_est,
-    user_email,
-    campaign_id,
-    click_id,
-    tracker,
-    n_clid,
-    initial_referring_domain,
-    initial_current_url
-FROM ranked_events
-WHERE row_num = 1
-ORDER BY timestamp_est DESC
-LIMIT 1500;
+    formatDateTime(toTimeZone(person.properties.first_joined_at_epoch, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS first_joined_at,
+    formatDateTime(toTimeZone(e.timestamp, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS timestamp_est,
+    person.properties.email AS user_email,
+    person.properties.ref AS ref,
+    person.properties.source AS source,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'campaign'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'Campaign'), '')
+    ) AS campaign_id,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'ClickID'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'clickid'), '')
+    ) AS click_id,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'Tracker'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'tracker'), '')
+    ) AS tracker,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'N_CLID'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'aclid'), '')
+    ) AS n_clid,
+    person.properties.$initial_referring_domain AS initial_referring_domain,
+    person.properties.$initial_current_url AS initial_current_url
+FROM events e
+WHERE e.event IN (
+    'sticky_subscription_activated',
+    'chargebee_subscription_created',
+    'balance_add_first_yearly_credits',
+    'balance_add_monthly_credits',
+    'upgate_subscription_activated'
+)
+AND toDate(toTimeZone(e.timestamp, 'America/New_York')) >= toDate('${startDateStr}')
+AND toDate(toTimeZone(e.timestamp, 'America/New_York')) <= toDate('${endDateStr}')
+AND LOWER(person.properties.ref) = 'trafficjunky'
+AND (person.properties.source IS NULL OR LOWER(person.properties.source) != 'header')
+ORDER BY e.timestamp ASC
+LIMIT 2000;
   `.trim();
   
   return query;
@@ -1466,9 +1905,10 @@ function fetchPostHogConversionsSingle(startDateStr, endDateStr) {
 /**
  * Fetch PostHog conversions day by day with INCREMENTAL WRITING to sheet
  * Data appears in real-time as each day is fetched
+ * DEDUPLICATION: Only keeps first conversion per unique email (done client-side)
  */
 function fetchPostHogConversionsByDay(startDate, endDate) {
-  Logger.log(`=== Day-by-Day Fetch Starting (Incremental Write) ===`);
+  Logger.log(`=== Day-by-Day Fetch Starting (Incremental Write + Dedup) ===`);
   Logger.log(`From: ${startDate} To: ${endDate}`);
   
   // Prepare the sheet first
@@ -1491,6 +1931,8 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     'N_CLID',
     'Referring Domain',
     'Initial URL',
+    'Ref',
+    'Source',
     'Last Updated'
   ];
   
@@ -1507,15 +1949,17 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     sheet.setFrozenRows(1);
   }
   
-  SpreadsheetApp.flush(); // Show cleared sheet immediately
+  // Skip initial flush - let it happen naturally with first write
   
   let columns = null;
   const currentDate = new Date(startDate);
   let totalFetched = 0;
+  let totalFromAPI = 0;
   let daysProcessed = 0;
   let errorsEncountered = 0;
   let currentRow = 2; // Start writing from row 2
   const now = new Date();
+  const seenEmails = new Set(); // Track emails for deduplication
   
   while (currentDate <= endDate) {
     const dateStr = formatDateForDisplay(currentDate);
@@ -1534,31 +1978,58 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
         Logger.log(`  Captured columns: ${JSON.stringify(columns)}`);
       }
       
-      // IMMEDIATELY write this day's results to the sheet
+      // IMMEDIATELY write this day's results to the sheet (with deduplication by email)
       if (dayData.results && Array.isArray(dayData.results) && dayData.results.length > 0 && columns) {
         const colIndex = {};
         columns.forEach((col, idx) => { colIndex[col] = idx; });
         
-        const rows = dayData.results.map(result => [
-          result[colIndex['first_joined_at']] || '',
-          result[colIndex['timestamp_est']] || '',
-          result[colIndex['user_email']] || '',
-          result[colIndex['campaign_id']] || '',
-          result[colIndex['click_id']] || '',
-          result[colIndex['tracker']] || '',
-          result[colIndex['n_clid']] || '',
-          result[colIndex['initial_referring_domain']] || '',
-          result[colIndex['initial_current_url']] || '',
-          now
-        ]);
+        totalFromAPI += dayData.results.length;
         
-        // Write to sheet immediately
-        sheet.getRange(currentRow, 1, rows.length, headers.length).setValues(rows);
-        SpreadsheetApp.flush(); // Force display update
+        // Filter out duplicate emails (keep first occurrence)
+        const rows = [];
+        for (const result of dayData.results) {
+          const email = result[colIndex['user_email']] || '';
+          
+          // Skip if we've already seen this email
+          if (email && seenEmails.has(email)) {
+            continue;
+          }
+          
+          // Mark email as seen
+          if (email) {
+            seenEmails.add(email);
+          }
+          
+          rows.push([
+            result[colIndex['first_joined_at']] || '',
+            result[colIndex['timestamp_est']] || '',
+            email,
+            result[colIndex['campaign_id']] || '',
+            result[colIndex['click_id']] || '',
+            result[colIndex['tracker']] || '',
+            result[colIndex['n_clid']] || '',
+            result[colIndex['initial_referring_domain']] || '',
+            result[colIndex['initial_current_url']] || '',
+            result[colIndex['ref']] || '',
+            result[colIndex['source']] || '',
+            now
+          ]);
+        }
         
-        currentRow += rows.length;
-        totalFetched += dayData.results.length;
-        Logger.log(`  ✓ Wrote ${dayData.results.length} conversions for ${dateStr} (running total: ${totalFetched})`);
+        // Write to sheet immediately (only unique emails)
+        if (rows.length > 0) {
+          sheet.getRange(currentRow, 1, rows.length, headers.length).setValues(rows);
+          
+          // Only flush every 3 days to reduce overhead
+          if (daysProcessed % 3 === 0) {
+            SpreadsheetApp.flush();
+          }
+          
+          currentRow += rows.length;
+          totalFetched += rows.length;
+        }
+        
+        Logger.log(`  ✓ Wrote ${rows.length} unique conversions for ${dateStr} (${dayData.results.length} from API, running total: ${totalFetched})`);
       } else if (dayData.results && dayData.results.length === 0) {
         Logger.log(`  ⚠ No conversions for ${dateStr}`);
       } else {
@@ -1574,12 +2045,16 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     // Move to next day
     currentDate.setDate(currentDate.getDate() + 1);
     
-    // Small delay to avoid rate limiting
-    Utilities.sleep(200);
+    // Minimal delay to avoid rate limiting
+    Utilities.sleep(50);
   }
   
+  // Final flush to ensure all data is displayed
+  SpreadsheetApp.flush();
+  
   Logger.log(`=== Day-by-Day Fetch Complete ===`);
-  Logger.log(`Days processed: ${daysProcessed}, Errors: ${errorsEncountered}, Total conversions: ${totalFetched}`);
+  Logger.log(`Days processed: ${daysProcessed}, Errors: ${errorsEncountered}`);
+  Logger.log(`Total from API: ${totalFromAPI}, Unique conversions written: ${totalFetched}`);
   
   // Return summary (data already written to sheet)
   return {
@@ -1622,6 +2097,8 @@ function writeConversionsToSheet(data, startDateStr, endDateStr) {
     'N_CLID',
     'Referring Domain',
     'Initial URL',
+    'Ref',
+    'Source',
     'Last Updated'
   ];
   
@@ -1672,6 +2149,8 @@ function writeConversionsToSheet(data, startDateStr, endDateStr) {
       result[colIndex['n_clid']] || '',
       result[colIndex['initial_referring_domain']] || '',
       result[colIndex['initial_current_url']] || '',
+      result[colIndex['ref']] || '',
+      result[colIndex['source']] || '',
       now
     ];
     rows.push(row);
@@ -1930,7 +2409,7 @@ function clearConversionData() {
     if (sheet) {
       const lastRow = sheet.getLastRow();
       if (lastRow > 1) {
-        sheet.getRange(2, 1, lastRow - 1, 10).clearContent();
+        sheet.getRange(2, 1, lastRow - 1, 12).clearContent();
       }
       ui.alert('Conversion data cleared successfully.');
     } else {
@@ -2396,7 +2875,8 @@ function fetchAllData(startDate, endDate) {
     tjAggregated: { success: false, message: '' },
     tjDaily: { success: false, message: '' },
     posthog: { success: false, message: '' },
-    redtrack: { success: false, message: '' }
+    redtrack: { success: false, message: '' },
+    creatives: { success: false, message: '' }
   };
   
   // 1. Fetch TrafficJunky Aggregated Data
@@ -2441,6 +2921,16 @@ function fetchAllData(startDate, endDate) {
     Logger.log(`RedTrack error: ${error.toString()}`);
   }
   
+  // 5. Fetch Creative Data
+  try {
+    Logger.log('Fetching creative data...');
+    fetchAndWriteCreatives(startDate, endDate);
+    results.creatives = { success: true, message: 'Creative data loaded' };
+  } catch (error) {
+    results.creatives = { success: false, message: `Creatives Error: ${error.toString()}` };
+    Logger.log(`Creatives error: ${error.toString()}`);
+  }
+  
   // Show summary
   const summary = [
     `Data fetch complete for ${startDateStr} to ${endDateStr}:`,
@@ -2448,7 +2938,8 @@ function fetchAllData(startDate, endDate) {
     `${results.tjAggregated.success ? '✓' : '✗'} ${results.tjAggregated.message}`,
     `${results.tjDaily.success ? '✓' : '✗'} ${results.tjDaily.message}`,
     `${results.posthog.success ? '✓' : '✗'} ${results.posthog.message}`,
-    `${results.redtrack.success ? '✓' : '✗'} ${results.redtrack.message}`
+    `${results.redtrack.success ? '✓' : '✗'} ${results.redtrack.message}`,
+    `${results.creatives.success ? '✓' : '✗'} ${results.creatives.message}`
   ].join('\n');
   
   ui.alert('All Data Sources', summary, ui.ButtonSet.OK);
@@ -2637,7 +3128,8 @@ function clearAllData() {
     '• TJ Aggregated Data\n' +
     '• TJ Daily Breakdown\n' +
     '• PostHog Conversions\n' +
-    '• RedTrack Conversions\n\n' +
+    '• RedTrack Conversions\n' +
+    '• Creative Data\n\n' +
     'Headers and formulas beyond data columns will be preserved.',
     ui.ButtonSet.YES_NO
   );
@@ -2682,7 +3174,7 @@ function clearAllData() {
       if (phSheet) {
         const lastRow = phSheet.getLastRow();
         if (lastRow > 1) {
-          phSheet.getRange(2, 1, lastRow - 1, 10).clearContent();
+          phSheet.getRange(2, 1, lastRow - 1, 12).clearContent();
         }
         cleared.push('PostHog Conversions');
       }
@@ -2703,6 +3195,20 @@ function clearAllData() {
       }
     } catch (e) {
       errors.push('RedTrack: ' + e.toString());
+    }
+    
+    // Clear Creative Data
+    try {
+      const creativeSheet = ss.getSheetByName(CREATIVES_SHEET_NAME);
+      if (creativeSheet) {
+        const lastRow = creativeSheet.getLastRow();
+        if (lastRow > 1) {
+          creativeSheet.getRange(2, 1, lastRow - 1, 19).clearContent();
+        }
+        cleared.push('Creative Data');
+      }
+    } catch (e) {
+      errors.push('Creatives: ' + e.toString());
     }
     
     // Show summary

@@ -1,11 +1,21 @@
 /**
- * TrafficJunky API Data Extractor for Google Sheets
+ * TrafficJunky API Data Extractor for Google Sheets - V9.0
  * This script pulls campaign data from TrafficJunky API and populates it into Google Sheets
+ * V9.0: **POSTHOG TIMEOUT FIX** - Added better rate limiting and batch processing for PostHog conversions
+ * V8.0: HYBRID APPROACH - Uses BOTH endpoints for complete data!
+ * V7.19: Fixed field names for snake_case
+ * V7.18: Switched endpoint to /api/campaigns/stats.json
+ * V7.10: Added Date Range column (Q)
+ * V7.8: Added pagination with incremental writing
+ * V7.7: Added "Last 7 Days inc Today (EST)" menu option
+ * V7.6: TrafficJunky changed max limit from 1000 to 500
  */
 
 // Configuration
 const API_KEY = "9c77fe112485aff1fc1266f21994de5fabcf8df5f45886c0504494bc4ea0479156092332fc020799a6183b154b467f2bb3e2b169e4886504d83e63fe08c4f039";
-const API_URL = "https://api.trafficjunky.com/api/campaigns/bids/stats.json";
+const API_URL_STATS = "https://api.trafficjunky.com/api/campaigns/stats.json"; // For bulk stats with good pagination
+const API_URL_BIDS = "https://api.trafficjunky.com/api/campaigns/bids/stats.json"; // For additional fields
+const API_URL = API_URL_STATS; // Default endpoint for compatibility
 const SHEET_NAME = "RAW Data - DNT"; // Aggregated campaign data sheet
 const DAILY_SHEET_NAME = "RAW_DailyData-DNT"; // Sheet for daily breakdown data
 const API_TIMEZONE = "America/New_York"; // TrafficJunky API uses EST/EDT
@@ -26,6 +36,58 @@ const REDTRACK_CAMPAIGN_IDS = [
   "692e7bedbc9773c782761c97",
   "6913ebf5e14b3217fa1bfa97"
 ];  // Campaign IDs to filter conversions
+
+// ============================================================================
+// ROW COUNT TRACKING - Saves/retrieves row counts for precise clearing
+// ============================================================================
+
+/**
+ * Save the number of data rows written to a sheet
+ * @param {string} sheetName - Name of the sheet
+ * @param {number} count - Number of data rows (excluding header)
+ */
+function saveRowCount(sheetName, count) {
+  const props = PropertiesService.getScriptProperties();
+  props.setProperty(`rowCount_${sheetName}`, String(count));
+  Logger.log(`Saved row count for ${sheetName}: ${count}`);
+}
+
+/**
+ * Get the saved row count for a sheet
+ * @param {string} sheetName - Name of the sheet
+ * @param {number} fallback - Fallback value if no saved count exists
+ * @returns {number} The saved row count or fallback
+ */
+function getRowCount(sheetName, fallback) {
+  const props = PropertiesService.getScriptProperties();
+  const saved = props.getProperty(`rowCount_${sheetName}`);
+  if (saved) {
+    const count = parseInt(saved, 10);
+    Logger.log(`Retrieved saved row count for ${sheetName}: ${count}`);
+    return count;
+  }
+  Logger.log(`No saved row count for ${sheetName}, using fallback: ${fallback}`);
+  return fallback;
+}
+
+/**
+ * Clear data rows from a sheet using tracked row count
+ * @param {Sheet} sheet - The sheet to clear
+ * @param {string} sheetName - Name of the sheet (for property lookup)
+ * @param {number} startRow - First data row (e.g., 2 for header in row 1, 3 if row 2 has formulas)
+ * @param {number} numColumns - Number of columns to clear
+ * @param {number} fallbackRows - Fallback max rows if no saved count
+ */
+function clearDataRows(sheet, sheetName, startRow, numColumns, fallbackRows) {
+  const rowCount = getRowCount(sheetName, fallbackRows);
+  if (rowCount > 0) {
+    Logger.log(`Clearing ${rowCount} rows from ${sheetName} (row ${startRow} to ${startRow + rowCount - 1}, columns 1-${numColumns})`);
+    sheet.getRange(startRow, 1, rowCount, numColumns).clearContent();
+    Logger.log(`Cleared successfully`);
+  } else {
+    Logger.log(`No rows to clear for ${sheetName}`);
+  }
+}
 
 /**
  * Helper function to get current date/time in EST timezone
@@ -78,6 +140,7 @@ function onOpen() {
       .addItem('📅 Today (EST)', 'pullAllDataToday')
       .addItem('📆 Yesterday (EST)', 'pullAllDataYesterday')
       .addItem('📊 Last 7 Days (EST)', 'pullAllDataLast7Days')
+      .addItem('📊 Last 7 Days inc Today (EST)', 'pullAllDataLast7DaysIncToday')
       .addItem('📊 Last 14 Days (EST)', 'pullAllDataLast14Days')
       .addItem('📈 Last 30 Days (EST)', 'pullAllDataLast30Days')
       .addItem('📅 This Month (EST)', 'pullAllDataThisMonth')
@@ -90,6 +153,7 @@ function onOpen() {
       .addItem('📅 Today (EST)', 'pullTJToday')
       .addItem('📆 Yesterday (EST)', 'pullTJYesterday')
       .addItem('📊 Last 7 Days (EST)', 'pullLast7Days')
+      .addItem('📊 Last 7 Days inc Today (EST)', 'pullLast7DaysIncToday')
       .addItem('📊 Last 14 Days (EST)', 'pullTJLast14Days')
       .addItem('📈 Last 30 Days (EST)', 'pullTrafficJunkyData')
       .addItem('📅 This Month (EST)', 'pullThisMonth')
@@ -102,6 +166,7 @@ function onOpen() {
       .addItem('📅 Today (EST)', 'updateDailyToday')
       .addItem('📆 Yesterday (EST)', 'updateDailyYesterday')
       .addItem('📊 Last 7 Days (EST)', 'updateDailyLast7Days')
+      .addItem('📊 Last 7 Days inc Today (EST)', 'updateDailyLast7DaysIncToday')
       .addItem('📊 Last 14 Days (EST)', 'updateDailyLast14Days')
       .addItem('📈 Last 30 Days (EST)', 'updateDailyLast30Days')
       .addItem('📅 This Month (EST)', 'updateDailyThisMonth')
@@ -114,6 +179,7 @@ function onOpen() {
       .addItem('📅 Today (EST)', 'pullTodayConversions')
       .addItem('📆 Yesterday (EST)', 'pullYesterdayConversions')
       .addItem('📊 Last 7 Days (EST)', 'pullConversionsLast7Days')
+      .addItem('📊 Last 7 Days inc Today (EST)', 'pullConversionsLast7DaysIncToday')
       .addItem('📊 Last 14 Days (EST)', 'pullConversionsLast14Days')
       .addItem('📈 Last 30 Days (EST)', 'pullConversionsLast30Days')
       .addItem('📅 This Month (EST)', 'pullConversionsThisMonth')
@@ -126,6 +192,7 @@ function onOpen() {
       .addItem('📅 Today (EST)', 'pullRedTrackToday')
       .addItem('📆 Yesterday (EST)', 'pullRedTrackYesterday')
       .addItem('📊 Last 7 Days (EST)', 'pullRedTrackLast7Days')
+      .addItem('📊 Last 7 Days inc Today (EST)', 'pullRedTrackLast7DaysIncToday')
       .addItem('📊 Last 14 Days (EST)', 'pullRedTrackLast14Days')
       .addItem('📈 Last 30 Days (EST)', 'pullRedTrackLast30Days')
       .addItem('📅 This Month (EST)', 'pullRedTrackThisMonth')
@@ -172,6 +239,26 @@ function pullLast7Days() {
     
   } catch (error) {
     Logger.log("Error in pullLast7Days: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull data for last 7 days INCLUDING today
+ */
+function pullLast7DaysIncToday() {
+  try {
+    const endDate = getESTDate(); // Today
+    endDate.setHours(23, 59, 59, 999); // End of today
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 6); // 6 days before today = 7 days total
+    startDate.setHours(0, 0, 0, 0); // Start of that day
+    
+    fetchAndWriteData(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullLast7DaysIncToday: " + error.toString());
     SpreadsheetApp.getUi().alert('Error: ' + error.toString());
   }
 }
@@ -332,50 +419,218 @@ function pullCustomDateRange() {
 }
 
 /**
- * Fetches data from TrafficJunky API and writes to sheet
+ * Fetches data from TrafficJunky API using HYBRID approach and writes to sheet
+ * V8.0: Uses TWO endpoints for complete data
  */
 function fetchAndWriteData(startDate, endDate) {
   const ui = SpreadsheetApp.getUi();
   
-  // Allow current day pulls for real-time stats (EST timezone)
-  Logger.log(`Fetching TJ data - allowing current day pulls`);
-  
-  // Show loading message
-  ui.alert('Fetching data from TrafficJunky API (EST timezone)...');
+  Logger.log(`V8: Fetching TJ data using HYBRID approach`);
   
   // Format dates as DD/MM/YYYY (TrafficJunky API format)
   const formattedStartDate = formatDate(startDate);
   const formattedEndDate = formatDate(endDate);
   
-  Logger.log(`Fetching data from ${formattedStartDate} to ${formattedEndDate} (EST timezone)`);
-  
-  // Build API URL with parameters
-  const url = `${API_URL}?api_key=${API_KEY}&startDate=${formattedStartDate}&endDate=${formattedEndDate}&limit=1000&offset=1`;
+  ui.alert(`Fetching data from ${formattedStartDate} to ${formattedEndDate}...\n\nUsing hybrid approach (2 endpoints)`);
+  Logger.log(`Fetching data from ${formattedStartDate} to ${formattedEndDate}`);
   
   try {
-    // Make API request
-    const response = UrlFetchApp.fetch(url, {
+    // STEP 1: Fetch all campaigns with stats (good pagination!)
+    Logger.log(`STEP 1: Fetching campaign stats from /api/campaigns/stats.json`);
+    const allCampaignStats = {};
+    let offset = 1;
+    let hasMoreData = true;
+    let totalFetched = 0;
+    const limit = 500;
+    
+    while (hasMoreData) {
+      Logger.log(`  Fetching stats batch with offset=${offset}`);
+      const url = `${API_URL_STATS}?api_key=${API_KEY}&startDate=${formattedStartDate}&endDate=${formattedEndDate}&limit=${limit}&offset=${offset}`;
+      
+      const response = UrlFetchApp.fetch(url, {
+        'method': 'get',
+        'contentType': 'application/json',
+        'muteHttpExceptions': true
+      });
+      
+      if (response.getResponseCode() !== 200) {
+        throw new Error(`Stats API error: ${response.getContentText()}`);
+      }
+      
+      const jsonData = JSON.parse(response.getContentText());
+      
+      if (jsonData && jsonData.message) {
+        throw new Error(`Stats API Error: ${jsonData.message}`);
+      }
+      
+      // Stats endpoint returns: { "campaign_id": [{stats}], ... }
+      // Use Object.values() to get all the arrays, then flatten
+      let batchCount = 0;
+      if (typeof jsonData === 'object' && jsonData !== null) {
+        for (let campaignId in jsonData) {
+          const statsData = jsonData[campaignId];
+          
+          // Handle both array and object formats
+          let stats = null;
+          if (Array.isArray(statsData) && statsData.length > 0) {
+            stats = statsData[0]; // Take first element from array
+          } else if (typeof statsData === 'object') {
+            stats = statsData; // Already an object
+          }
+          
+          if (stats && stats.campaign_id) {
+            allCampaignStats[stats.campaign_id] = stats;
+            batchCount++;
+          }
+        }
+      }
+      
+      totalFetched += batchCount;
+      Logger.log(`    → Got ${batchCount} campaigns (Total: ${totalFetched})`);
+      
+      if (batchCount < limit) {
+        hasMoreData = false;
+        Logger.log(`    → Less than ${limit} campaigns, stopping pagination`);
+      } else {
+        offset += limit; // Jump by 500!
+      }
+      
+      if (offset > 5000) {
+        Logger.log(`    → Safety limit reached`);
+        hasMoreData = false;
+      }
+    }
+    
+    Logger.log(`✅ STEP 1 Complete: ${totalFetched} campaigns from stats endpoint`);
+    
+    // STEP 2: Fetch additional fields from bids endpoint (single call)
+    Logger.log(`STEP 2: Fetching additional fields from /api/campaigns/bids/stats.json`);
+    const additionalFields = {};
+    
+    const bidsUrl = `${API_URL_BIDS}?api_key=${API_KEY}&startDate=${formattedStartDate}&endDate=${formattedEndDate}&limit=500&offset=1`;
+    const bidsResponse = UrlFetchApp.fetch(bidsUrl, {
       'method': 'get',
       'contentType': 'application/json',
       'muteHttpExceptions': true
     });
     
-    const responseCode = response.getResponseCode();
-    
-    if (responseCode !== 200) {
-      throw new Error(`API returned status code ${responseCode}: ${response.getContentText()}`);
+    if (bidsResponse.getResponseCode() === 200) {
+      const bidsData = JSON.parse(bidsResponse.getContentText());
+      
+      let campaigns = [];
+      if (Array.isArray(bidsData)) {
+        campaigns = bidsData;
+      } else if (typeof bidsData === 'object' && bidsData !== null) {
+        campaigns = Object.values(bidsData);
+      }
+      
+      for (let campaign of campaigns) {
+        if (campaign && campaign.campaignId) {
+          const id = String(campaign.campaignId);
+          additionalFields[id] = {
+            status: campaign.status || '',
+            dailyBudget: campaign.dailyBudget || 0,
+            dailyBudgetLeft: campaign.dailyBudgetLeft || 0,
+            numberOfBids: campaign.numberOfBids || 0,
+            numberOfCreative: campaign.numberOfCreative || 0,
+            CPM: campaign.CPM || 0
+          };
+        }
+      }
+      
+      Logger.log(`✅ STEP 2 Complete: Got additional fields for ${Object.keys(additionalFields).length} campaigns`);
+    } else {
+      Logger.log(`⚠️ STEP 2 Warning: Could not fetch additional fields, will use defaults`);
     }
     
-    const jsonData = JSON.parse(response.getContentText());
-    Logger.log(`Received data for ${Object.keys(jsonData).length} campaigns`);
+    // STEP 3: Merge data and write to sheet
+    Logger.log(`STEP 3: Merging data and writing to sheet`);
     
-    // Process and write data
-    writeDataToSheet(jsonData, formattedStartDate, formattedEndDate);
+    const ss = SpreadsheetApp.getActiveSpreadsheet();
+    let sheet = ss.getSheetByName(SHEET_NAME);
     
-    ui.alert('Success!', 'Data has been successfully imported from TrafficJunky API.', ui.ButtonSet.OK);
+    if (!sheet) {
+      sheet = ss.insertSheet(SHEET_NAME);
+    }
+    
+    // Clear existing data using tracked row count (with fallback)
+    clearDataRows(sheet, SHEET_NAME, 2, 17, 3000);
+    
+    // Write headers
+    const headers = [
+      'Campaign ID', 'Campaign Name', 'Campaign Type', 'Status',
+      'Daily Budget', 'Daily Budget Left', 'Ads Paused', 'Number of Bids',
+      'Number of Creatives', 'Impressions', 'Clicks', 'Conversions',
+      'Cost', 'CTR', 'CPM', 'Last Updated', 'Date Range'
+    ];
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
+    sheet.setFrozenRows(1);
+    
+    // Build merged rows
+    const rows = [];
+    const now = new Date();
+    const dateRange = `${formattedStartDate} to ${formattedEndDate}`;
+    
+    for (let campaignId in allCampaignStats) {
+      const stats = allCampaignStats[campaignId];
+      const additional = additionalFields[campaignId] || {};
+      
+      const row = [
+        stats.campaign_id || campaignId,
+        stats.campaign_name || '',
+        stats.campaign_type || '',
+        additional.status || 'Unknown',
+        toNumeric(additional.dailyBudget, 0),
+        toNumeric(additional.dailyBudgetLeft, 0),
+        toNumeric(stats.ads_paused, 0),
+        toNumeric(additional.numberOfBids, 0),
+        toNumeric(additional.numberOfCreative, 0),
+        toNumeric(stats.impressions, 0),
+        toNumeric(stats.clicks, 0),
+        toNumeric(stats.conversions, 0),
+        toNumeric(stats.ecpc, 0) * toNumeric(stats.clicks, 0), // Calculate cost from ecpc * clicks
+        toNumeric(stats.ctr, 0),
+        toNumeric(additional.CPM || stats.ecpm, 0), // Prefer CPM from bids, fallback to ecpm
+        now,
+        dateRange
+      ];
+      rows.push(row);
+    }
+    
+    Logger.log(`  Writing ${rows.length} merged rows to sheet`);
+    
+    if (rows.length > 0) {
+      // Write in batches of 100 to avoid timeout
+      const BATCH_SIZE = 100;
+      let written = 0;
+      
+      for (let i = 0; i < rows.length; i += BATCH_SIZE) {
+        const batch = rows.slice(i, Math.min(i + BATCH_SIZE, rows.length));
+        const startRow = 2 + i;
+        
+        Logger.log(`  → Writing batch ${Math.floor(i / BATCH_SIZE) + 1}: rows ${startRow} to ${startRow + batch.length - 1}`);
+        sheet.getRange(startRow, 1, batch.length, headers.length).setValues(batch);
+        written += batch.length;
+        
+        if (i % 300 === 0) { // Flush every 3 batches
+          SpreadsheetApp.flush();
+        }
+      }
+      
+      SpreadsheetApp.flush(); // Final flush
+      Logger.log(`  ✓ Wrote ${written} rows total`);
+      
+      // Save row count for precise clearing later
+      saveRowCount(SHEET_NAME, rows.length);
+    }
+    
+    Logger.log(`✅ STEP 3 Complete: ${rows.length} campaigns written`);
+    
+    ui.alert('Success!', `Data imported from ${formattedStartDate} to ${formattedEndDate}\n\nCampaigns: ${rows.length}\nWith additional fields: ${Object.keys(additionalFields).length}`, ui.ButtonSet.OK);
     
   } catch (error) {
-    Logger.log("Error fetching data: " + error.toString());
+    Logger.log("Error in hybrid fetch: " + error.toString());
     ui.alert('Error fetching data: ' + error.toString());
   }
 }
@@ -449,8 +704,27 @@ function writeDataToSheet(apiData, startDate, endDate) {
   
   Logger.log(`Processing ${campaigns.length} campaigns...`);
   
-  // Convert campaigns to rows
-  for (let campaign of campaigns) {
+  // Convert campaigns to rows - V7 ENHANCED with debugging
+  for (let i = 0; i < campaigns.length; i++) {
+    const campaign = campaigns[i];
+    
+    // DEBUG: Log first campaign in detail
+    if (i === 0) {
+      Logger.log(`=== FIRST CAMPAIGN DEBUG ===`);
+      Logger.log(`Type: ${typeof campaign}`);
+      Logger.log(`Is null: ${campaign === null}`);
+      Logger.log(`Is undefined: ${campaign === undefined}`);
+      
+      if (campaign && typeof campaign === 'object') {
+        Logger.log(`Keys: ${Object.keys(campaign).join(', ')}`);
+        Logger.log(`Sample JSON: ${JSON.stringify(campaign).substring(0, 300)}...`);
+        Logger.log(`campaignId: ${campaign.campaignId}`);
+        Logger.log(`id: ${campaign.id}`);
+        Logger.log(`campaignName: ${campaign.campaignName}`);
+      }
+      Logger.log(`=== END DEBUG ===`);
+    }
+    
     if (campaign && typeof campaign === 'object') {
       const row = [
         campaign.campaignId || campaign.id || 'unknown',
@@ -471,6 +745,13 @@ function writeDataToSheet(apiData, startDate, endDate) {
         new Date()
       ];
       rows.push(row);
+      
+      // Log first successful row
+      if (rows.length === 1) {
+        Logger.log(`✓ First row created successfully with ${row.length} columns`);
+      }
+    } else {
+      Logger.log(`✗ Campaign ${i} SKIPPED - type: ${typeof campaign}, null: ${campaign === null}, undef: ${campaign === undefined}`);
     }
   }
   
@@ -599,6 +880,26 @@ function updateDailyLast7Days() {
     
   } catch (error) {
     Logger.log("Error in updateDailyLast7Days: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Update daily data for last 7 days INCLUDING today
+ */
+function updateDailyLast7DaysIncToday() {
+  try {
+    const endDate = getESTDate(); // Today
+    endDate.setHours(23, 59, 59, 999);
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 6); // 6 days before today = 7 days total
+    startDate.setHours(0, 0, 0, 0);
+    
+    updateDailyData(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in updateDailyLast7DaysIncToday: " + error.toString());
     SpreadsheetApp.getUi().alert('Error: ' + error.toString());
   }
 }
@@ -760,20 +1061,41 @@ function updateDailyCustomRange() {
  * This function only updates data for the specified date range, preserving historical data
  */
 function updateDailyData(startDate, endDate) {
+  Logger.log(`=== updateDailyData START ===`);
+  Logger.log(`Date range: ${startDate} to ${endDate}`);
+  
   const ui = SpreadsheetApp.getUi();
+  Logger.log(`Getting active spreadsheet...`);
   const ss = SpreadsheetApp.getActiveSpreadsheet();
+  Logger.log(`Got spreadsheet`);
   
-  // Allow current day pulls for real-time stats (EST timezone)
-  Logger.log(`Fetching daily data - allowing current day pulls`);
-  
-  ui.alert('Fetching daily breakdown data from TrafficJunky API (EST timezone)...');
-  
-  // Get or create daily sheet
-  let sheet = ss.getSheetByName(DAILY_SHEET_NAME);
-  const isNewSheet = !sheet;
+  // Try faster sheet lookup using getSheets() instead of getSheetByName()
+  Logger.log(`Getting daily sheet (fast method)...`);
+  let sheet = null;
+  const allSheets = ss.getSheets();
+  Logger.log(`Got ${allSheets.length} sheets, searching for ${DAILY_SHEET_NAME}...`);
+  for (let s of allSheets) {
+    if (s.getName() === DAILY_SHEET_NAME) {
+      sheet = s;
+      break;
+    }
+  }
+  let isNewSheet = !sheet;
+  Logger.log(`Sheet lookup complete, found: ${!isNewSheet}`);
   
   if (!sheet) {
+    Logger.log(`Creating new daily sheet...`);
     sheet = ss.insertSheet(DAILY_SHEET_NAME);
+    // Write headers
+    const headers = [
+      'Date', 'Campaign ID', 'Campaign Name', 'Campaign Type', 'Status',
+      'Impressions', 'Clicks', 'Conversions', 'Cost', 'CTR', 'CPM', 'Last Updated'
+    ];
+    sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
+    sheet.setFrozenRows(1);
+    Logger.log(`Created new daily sheet with headers`);
+  } else {
+    Logger.log(`Found existing daily sheet`);
   }
   
   // Define headers
@@ -792,26 +1114,34 @@ function updateDailyData(startDate, endDate) {
     'Last Updated'
   ];
   
-  // Always ensure headers are present
-  if (isNewSheet || sheet.getLastRow() === 0 || sheet.getRange(1, 1).getValue() !== 'Date') {
-    // Write headers
+  // Only write headers for new sheets (skip getValue check - it's slow on large sheets)
+  if (isNewSheet) {
+    Logger.log(`Writing headers to new sheet...`);
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
     sheet.setFrozenRows(1);
     Logger.log('Headers written to daily sheet');
+  } else {
+    Logger.log('Existing sheet - skipping header check to save time');
   }
   
-  // Fetch data day by day to get daily breakdown
-  const dailyData = [];
+  // Get the previous row count so we can clear excess at the end
+  const previousRowCount = getRowCount(DAILY_SHEET_NAME, 0);
+  Logger.log(`Previous row count: ${previousRowCount}`);
+  
+  Logger.log(`Starting day-by-day fetch loop (writing incrementally, NO upfront clear)...`);
   const currentDate = new Date(startDate);
+  let daysProcessed = 0;
+  let currentRow = 3; // Start writing at row 3 (after headers + formulas)
   
   while (currentDate <= endDate) {
     const dateStr = formatDate(currentDate);
-    Logger.log(`Fetching data for ${dateStr}`);
+    daysProcessed++;
+    Logger.log(`Day ${daysProcessed}: Fetching data for ${dateStr}`);
     
     try {
-      const url = `${API_URL}?api_key=${API_KEY}&startDate=${dateStr}&endDate=${dateStr}&limit=1000&offset=1`;
+      const url = `${API_URL}?api_key=${API_KEY}&startDate=${dateStr}&endDate=${dateStr}&limit=500&offset=1`;
       
+      Logger.log(`  Calling API...`);
       const response = UrlFetchApp.fetch(url, {
         'method': 'get',
         'contentType': 'application/json',
@@ -819,6 +1149,7 @@ function updateDailyData(startDate, endDate) {
       });
       
       const responseCode = response.getResponseCode();
+      Logger.log(`  Response code: ${responseCode}`);
       
       if (responseCode === 200) {
         const jsonData = JSON.parse(response.getContentText());
@@ -830,29 +1161,38 @@ function updateDailyData(startDate, endDate) {
           campaigns = Object.values(jsonData);
         }
         
-        // Process each campaign for this date
+        Logger.log(`  Got ${campaigns.length} campaigns for ${dateStr}`);
+        
+        // Build rows for this day
+        const dayRows = [];
         for (let campaign of campaigns) {
           if (campaign && typeof campaign === 'object') {
-            const row = [
+            dayRows.push([
               formatDateForDisplay(currentDate),
-              campaign.campaignId || campaign.id || 'unknown',
-              campaign.campaignName || '',
-              campaign.campaignType || '',
+              campaign.campaign_id || campaign.campaignId || campaign.id || 'unknown',
+              campaign.campaign_name || campaign.campaignName || '',
+              campaign.campaign_type || campaign.campaignType || '',
               campaign.status || '',
               toNumeric(campaign.impressions, 0),
               toNumeric(campaign.clicks, 0),
               toNumeric(campaign.conversions, 0),
               toNumeric(campaign.cost, 0),
-              toNumeric(campaign.CTR, 0),
-              toNumeric(campaign.CPM, 0),
+              toNumeric(campaign.ctr || campaign.CTR, 0),
+              toNumeric(campaign.ecpm || campaign.CPM, 0),
               new Date()
-            ];
-            dailyData.push(row);
+            ]);
           }
+        }
+        
+        // Write this day's data immediately (overwrite, no clear needed)
+        if (dayRows.length > 0) {
+          sheet.getRange(currentRow, 1, dayRows.length, 12).setValues(dayRows);
+          Logger.log(`  Wrote ${dayRows.length} rows at row ${currentRow}`);
+          currentRow += dayRows.length;
         }
       }
     } catch (error) {
-      Logger.log(`Error fetching data for ${dateStr}: ${error.toString()}`);
+      Logger.log(`  ✗ Error fetching data for ${dateStr}: ${error.toString()}`);
     }
     
     // Move to next day
@@ -860,23 +1200,25 @@ function updateDailyData(startDate, endDate) {
     Utilities.sleep(100); // Small delay to avoid rate limiting
   }
   
-  if (dailyData.length > 0) {
-    // Remove existing data for the date range being updated
-    removeDataForDateRange(sheet, startDate, endDate);
-    
-    // Append new data
-    const lastRow = sheet.getLastRow();
-    sheet.getRange(lastRow + 1, 1, dailyData.length, 12).setValues(dailyData);
-    
-    // Format columns
-    formatDailySheet(sheet, lastRow + 1, dailyData.length);
-    
-    // Sort by date descending, then by campaign name
-    const dataRange = sheet.getRange(2, 1, sheet.getLastRow() - 1, 12);
-    dataRange.sort([{column: 1, ascending: false}, {column: 3, ascending: true}]);
-    
-    ui.alert('Success!', `Updated ${dailyData.length} daily records from ${formatDateForDisplay(startDate)} to ${formatDateForDisplay(endDate)}.`, ui.ButtonSet.OK);
-    Logger.log(`Successfully updated ${dailyData.length} daily records`);
+  const totalRowsWritten = currentRow - 3;
+  Logger.log(`Day-by-day fetch complete. Total rows written: ${totalRowsWritten}`);
+  
+  // Save the new row count
+  saveRowCount(DAILY_SHEET_NAME, totalRowsWritten);
+  
+  // Clear any excess old data - use MAX of previousRowCount and fallback (5000)
+  // This ensures we clear old data even if row count was reset to 0
+  const maxPossibleOldRows = Math.max(previousRowCount, 5000);
+  if (maxPossibleOldRows > totalRowsWritten) {
+    const excessRows = maxPossibleOldRows - totalRowsWritten;
+    Logger.log(`Clearing ${excessRows} excess old rows starting at row ${currentRow}...`);
+    sheet.getRange(currentRow, 1, excessRows, 12).clearContent();
+    Logger.log(`Excess rows cleared`);
+  }
+  
+  if (totalRowsWritten > 0) {
+    ui.alert('Success!', `Updated ${totalRowsWritten} daily records from ${formatDateForDisplay(startDate)} to ${formatDateForDisplay(endDate)}.`, ui.ButtonSet.OK);
+    Logger.log(`Successfully updated ${totalRowsWritten} daily records`);
   } else {
     ui.alert('No data found for the selected date range.');
     Logger.log("No data found in API response");
@@ -933,7 +1275,7 @@ function fetchAllDataForDaily(startDate, endDate) {
     Logger.log(`Fetching daily data for ${dateStr}`);
     
     try {
-      const url = `${API_URL}?api_key=${API_KEY}&startDate=${dateStr}&endDate=${dateStr}&limit=1000&offset=1`;
+      const url = `${API_URL}?api_key=${API_KEY}&startDate=${dateStr}&endDate=${dateStr}&limit=500&offset=1`;
       
       const response = UrlFetchApp.fetch(url, {
         'method': 'get',
@@ -958,16 +1300,16 @@ function fetchAllDataForDaily(startDate, endDate) {
           if (campaign && typeof campaign === 'object') {
             const row = [
               formatDateForDisplay(currentDate),
-              campaign.campaignId || campaign.id || 'unknown',
-              campaign.campaignName || '',
-              campaign.campaignType || '',
+              campaign.campaign_id || campaign.campaignId || campaign.id || 'unknown',
+              campaign.campaign_name || campaign.campaignName || '',
+              campaign.campaign_type || campaign.campaignType || '',
               campaign.status || '',
               toNumeric(campaign.impressions, 0),
               toNumeric(campaign.clicks, 0),
               toNumeric(campaign.conversions, 0),
               toNumeric(campaign.cost, 0),
-              toNumeric(campaign.CTR, 0),
-              toNumeric(campaign.CPM, 0),
+              toNumeric(campaign.ctr || campaign.CTR, 0),
+              toNumeric(campaign.ecpm || campaign.CPM, 0),
               new Date()
             ];
             dailyData.push(row);
@@ -1009,27 +1351,44 @@ function fetchAllDataForDaily(startDate, endDate) {
 /**
  * Remove existing data for a specific date range from the daily sheet
  * Only clears columns A-L to preserve formulas in column M onwards
+ * SKIPS ROW 2 (formula row)
  */
 function removeDataForDateRange(sheet, startDate, endDate) {
   const lastRow = sheet.getLastRow();
-  if (lastRow <= 1) return; // Only header row
+  if (lastRow <= 2) return; // Only header and formula rows
   
   const startDateStr = formatDateForDisplay(startDate);
   const endDateStr = formatDateForDisplay(endDate);
   
-  // Get all dates in column A
-  const dateRange = sheet.getRange(2, 1, lastRow - 1, 1);
+  Logger.log(`removeDataForDateRange: Looking for dates between ${startDateStr} and ${endDateStr}`);
+  
+  // Get all dates in column A starting from row 3 (skip row 2 = formulas)
+  const dateRange = sheet.getRange(3, 1, lastRow - 2, 1);
   const dates = dateRange.getValues();
   
   // Find rows to clear (only columns A-L, preserving formulas in M onwards)
   let rowsCleared = 0;
   for (let i = 0; i < dates.length; i++) {
-    const rowDate = dates[i][0];
+    let rowDate = dates[i][0];
+    
+    // Convert to string if it's a Date object
+    if (rowDate instanceof Date) {
+      rowDate = formatDateForDisplay(rowDate);
+    } else if (typeof rowDate === 'string') {
+      // Ensure consistent format (trim whitespace)
+      rowDate = rowDate.trim();
+    } else {
+      continue; // Skip invalid dates
+    }
+    
+    Logger.log(`  Row ${i+3}: Comparing '${rowDate}' with range '${startDateStr}' to '${endDateStr}'`);
+    
     if (rowDate >= startDateStr && rowDate <= endDateStr) {
-      const actualRow = i + 2; // +2 because: array is 0-indexed, and we start from row 2
+      const actualRow = i + 3; // +3 because: array is 0-indexed, and we start from row 3
       // Clear only columns A through L (12 columns)
       sheet.getRange(actualRow, 1, 1, 12).clearContent();
       rowsCleared++;
+      Logger.log(`    ✓ Cleared row ${actualRow}`);
     }
   }
   
@@ -1065,28 +1424,27 @@ function formatDailySheet(sheet, startRow, numRows) {
  * Clear all daily data (only columns A-L, preserving formulas in M onwards)
  */
 function clearDailyData() {
+  Logger.log(`=== clearDailyData START ===`);
   const ui = SpreadsheetApp.getUi();
+  const rowCount = getRowCount(DAILY_SHEET_NAME, 0);
+  
   const result = ui.alert(
     'Clear Daily Data',
-    'Are you sure you want to clear all daily breakdown data (columns A-L)? Formulas in column M onwards will be preserved.',
+    `This will mark ${rowCount} rows as cleared.\nThe next data pull will overwrite from row 3.\n\nContinue?`,
     ui.ButtonSet.YES_NO
   );
   
   if (result === ui.Button.YES) {
-    const ss = SpreadsheetApp.getActiveSpreadsheet();
-    const sheet = ss.getSheetByName(DAILY_SHEET_NAME);
-    
-    if (sheet) {
-      const lastRow = sheet.getLastRow();
-      if (lastRow > 1) {
-        // Clear only columns A through L (12 columns), preserving formulas in M onwards
-        sheet.getRange(2, 1, lastRow - 1, 12).clearContent();
-      }
-      ui.alert('Daily data cleared successfully (columns A-L). Formulas in column M onwards are preserved.');
-    } else {
-      ui.alert('Daily data sheet not found.');
-    }
+    Logger.log(`User confirmed clear, resetting row count...`);
+    // Just reset the row count - no slow sheet operations
+    // The next update will overwrite from row 3 and clear excess
+    saveRowCount(DAILY_SHEET_NAME, 0);
+    Logger.log(`Row count reset to 0`);
+    ui.alert('Daily data marked as cleared.\nRun a data pull to refresh the sheet.');
+  } else {
+    Logger.log(`User cancelled clear operation`);
   }
+  Logger.log(`=== clearDailyData END ===`);
 }
 
 // ============================================================================
@@ -1316,63 +1674,47 @@ function showAPIDataStructure() {
  * @returns {string} The HogQL query string
  */
 function buildPostHogQuery(startDateStr, endDateStr) {
-  // Uses ROW_NUMBER to deduplicate by email - only keeps first conversion per user
+  // V5: Updated to use person.properties.ref and filter out header traffic
+  // Deduplication done client-side in Google Apps Script
   const query = `
-WITH ranked_events AS (
-    SELECT
-        formatDateTime(toTimeZone(person.properties.first_joined_at_epoch, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS first_joined_at,
-        formatDateTime(toTimeZone(e.timestamp, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS timestamp_est,
-        person.properties.email AS user_email,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'campaign'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'Campaign'), '')
-        ) AS campaign_id,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'ClickID'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'clickid'), '')
-        ) AS click_id,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'Tracker'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'tracker'), '')
-        ) AS tracker,
-        coalesce(
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'N_CLID'), ''),
-            nullIf(extractURLParameter(person.properties.$initial_current_url, 'aclid'), '')
-        ) AS n_clid,
-        person.properties.$initial_referring_domain AS initial_referring_domain,
-        person.properties.$initial_current_url AS initial_current_url,
-        ROW_NUMBER() OVER (PARTITION BY person.properties.email ORDER BY e.timestamp ASC) AS row_num
-    FROM events e
-    WHERE e.event IN (
-        'sticky_subscription_activated',
-        'chargebee_subscription_created',
-        'balance_add_first_yearly_credits',
-        'balance_add_monthly_credits',
-        'upgate_subscription_activated'
-    )
-    AND toDate(toTimeZone(e.timestamp, 'America/New_York')) >= toDate('${startDateStr}')
-    AND toDate(toTimeZone(e.timestamp, 'America/New_York')) <= toDate('${endDateStr}')
-    AND (
-        person.properties.$initial_current_url LIKE '%ref=TrafficJunky%' 
-        OR person.properties.$initial_current_url LIKE '%trafficjunky%'
-        OR person.properties.$initial_referring_domain LIKE '%.youporn.%'
-        OR person.properties.$initial_referring_domain LIKE '%.pornhub.%'
-    )
-)
 SELECT
-    first_joined_at,
-    timestamp_est,
-    user_email,
-    campaign_id,
-    click_id,
-    tracker,
-    n_clid,
-    initial_referring_domain,
-    initial_current_url
-FROM ranked_events
-WHERE row_num = 1
-ORDER BY timestamp_est DESC
-LIMIT 1500;
+    formatDateTime(toTimeZone(person.properties.first_joined_at_epoch, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS first_joined_at,
+    formatDateTime(toTimeZone(e.timestamp, 'America/New_York'), '%Y-%m-%d %H:%i:%s') AS timestamp_est,
+    person.properties.email AS user_email,
+    person.properties.ref AS ref,
+    person.properties.source AS source,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'campaign'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'Campaign'), '')
+    ) AS campaign_id,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'ClickID'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'clickid'), '')
+    ) AS click_id,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'Tracker'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'tracker'), '')
+    ) AS tracker,
+    coalesce(
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'N_CLID'), ''),
+        nullIf(extractURLParameter(person.properties.$initial_current_url, 'aclid'), '')
+    ) AS n_clid,
+    person.properties.$initial_referring_domain AS initial_referring_domain,
+    person.properties.$initial_current_url AS initial_current_url
+FROM events e
+WHERE e.event IN (
+    'sticky_subscription_activated',
+    'chargebee_subscription_created',
+    'balance_add_first_yearly_credits',
+    'balance_add_monthly_credits',
+    'upgate_subscription_activated'
+)
+AND toDate(toTimeZone(e.timestamp, 'America/New_York')) >= toDate('${startDateStr}')
+AND toDate(toTimeZone(e.timestamp, 'America/New_York')) <= toDate('${endDateStr}')
+AND LOWER(person.properties.ref) = 'trafficjunky'
+AND (person.properties.source IS NULL OR LOWER(person.properties.source) != 'header')
+ORDER BY e.timestamp ASC
+LIMIT 2000;
   `.trim();
   
   return query;
@@ -1398,14 +1740,9 @@ function fetchPostHogConversions(startDate, endDate) {
   
   Logger.log(`Days difference calculated: ${daysDiff}`);
   
-  // If more than 1 day, fetch day by day to avoid timeout
-  if (daysDiff > 1) {
-    Logger.log(`*** Using day-by-day fetch for ${daysDiff} days ***`);
-    return fetchPostHogConversionsByDay(startDate, endDate);
-  }
-  
-  Logger.log(`*** Using single fetch for 1 day ***`);
-  // Single day fetch
+  // ALWAYS fetch the entire range in one query - much faster than day-by-day
+  // Deduplication will happen in the processing step
+  Logger.log(`*** Fetching entire range: ${startDateStr} to ${endDateStr} ***`);
   return fetchPostHogConversionsSingle(startDateStr, endDateStr);
 }
 
@@ -1466,9 +1803,10 @@ function fetchPostHogConversionsSingle(startDateStr, endDateStr) {
 /**
  * Fetch PostHog conversions day by day with INCREMENTAL WRITING to sheet
  * Data appears in real-time as each day is fetched
+ * DEDUPLICATION: Only keeps first conversion per unique email (done client-side)
  */
 function fetchPostHogConversionsByDay(startDate, endDate) {
-  Logger.log(`=== Day-by-Day Fetch Starting (Incremental Write) ===`);
+  Logger.log(`=== Day-by-Day Fetch Starting (Incremental Write + Dedup) ===`);
   Logger.log(`From: ${startDate} To: ${endDate}`);
   
   // Prepare the sheet first
@@ -1491,13 +1829,17 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     'N_CLID',
     'Referring Domain',
     'Initial URL',
+    'Ref',
+    'Source',
     'Last Updated'
   ];
   
-  // Clear existing data
+  // Clear existing data quickly with clearContent (not deleteRows)
   const lastRow = sheet.getLastRow();
   if (lastRow > 1) {
+    Logger.log(`Clearing ${lastRow - 1} existing rows...`);
     sheet.getRange(2, 1, lastRow - 1, headers.length).clearContent();
+    Logger.log(`✓ Cleared existing data`);
   }
   
   // Write headers if needed
@@ -1507,15 +1849,17 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     sheet.setFrozenRows(1);
   }
   
-  SpreadsheetApp.flush(); // Show cleared sheet immediately
+  // Skip initial flush - let it happen naturally with first write
   
   let columns = null;
   const currentDate = new Date(startDate);
   let totalFetched = 0;
+  let totalFromAPI = 0;
   let daysProcessed = 0;
   let errorsEncountered = 0;
   let currentRow = 2; // Start writing from row 2
   const now = new Date();
+  const seenEmails = new Set(); // Track emails for deduplication
   
   while (currentDate <= endDate) {
     const dateStr = formatDateForDisplay(currentDate);
@@ -1534,31 +1878,67 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
         Logger.log(`  Captured columns: ${JSON.stringify(columns)}`);
       }
       
-      // IMMEDIATELY write this day's results to the sheet
+      // IMMEDIATELY write this day's results to the sheet (with deduplication by email)
       if (dayData.results && Array.isArray(dayData.results) && dayData.results.length > 0 && columns) {
         const colIndex = {};
         columns.forEach((col, idx) => { colIndex[col] = idx; });
         
-        const rows = dayData.results.map(result => [
-          result[colIndex['first_joined_at']] || '',
-          result[colIndex['timestamp_est']] || '',
-          result[colIndex['user_email']] || '',
-          result[colIndex['campaign_id']] || '',
-          result[colIndex['click_id']] || '',
-          result[colIndex['tracker']] || '',
-          result[colIndex['n_clid']] || '',
-          result[colIndex['initial_referring_domain']] || '',
-          result[colIndex['initial_current_url']] || '',
-          now
-        ]);
+        totalFromAPI += dayData.results.length;
         
-        // Write to sheet immediately
-        sheet.getRange(currentRow, 1, rows.length, headers.length).setValues(rows);
-        SpreadsheetApp.flush(); // Force display update
+        // Filter out duplicate emails (keep first occurrence)
+        const rows = [];
+        for (const result of dayData.results) {
+          const email = result[colIndex['user_email']] || '';
+          
+          // Skip if we've already seen this email
+          if (email && seenEmails.has(email)) {
+            continue;
+          }
+          
+          // Mark email as seen
+          if (email) {
+            seenEmails.add(email);
+          }
+          
+          // Format campaign ID as clean number
+          const rawCampaignId = result[colIndex['campaign_id']] || '';
+          let campaignId = '';
+          if (rawCampaignId !== '') {
+            const num = Number(rawCampaignId);
+            if (!isNaN(num)) {
+              campaignId = String(Math.floor(num));
+            } else {
+              campaignId = String(rawCampaignId).trim();
+            }
+          }
+          
+          rows.push([
+            result[colIndex['first_joined_at']] || '',
+            result[colIndex['timestamp_est']] || '',
+            email,
+            campaignId,
+            result[colIndex['click_id']] || '',
+            result[colIndex['tracker']] || '',
+            result[colIndex['n_clid']] || '',
+            result[colIndex['initial_referring_domain']] || '',
+            result[colIndex['initial_current_url']] || '',
+            result[colIndex['ref']] || '',
+            result[colIndex['source']] || '',
+            now
+          ]);
+        }
         
-        currentRow += rows.length;
-        totalFetched += dayData.results.length;
-        Logger.log(`  ✓ Wrote ${dayData.results.length} conversions for ${dateStr} (running total: ${totalFetched})`);
+        // Write to sheet immediately (only unique emails)
+        if (rows.length > 0) {
+          sheet.getRange(currentRow, 1, rows.length, headers.length).setValues(rows);
+          
+          // Only flush at the end to minimize overhead
+          
+          currentRow += rows.length;
+          totalFetched += rows.length;
+        }
+        
+        Logger.log(`  ✓ Wrote ${rows.length} unique conversions for ${dateStr} (${dayData.results.length} from API, running total: ${totalFetched})`);
       } else if (dayData.results && dayData.results.length === 0) {
         Logger.log(`  ⚠ No conversions for ${dateStr}`);
       } else {
@@ -1574,12 +1954,18 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
     // Move to next day
     currentDate.setDate(currentDate.getDate() + 1);
     
-    // Small delay to avoid rate limiting
-    Utilities.sleep(200);
+    // Small delay between API calls (same as TJ script uses)
+    if (currentDate <= endDate) {
+      Utilities.sleep(50);
+    }
   }
   
+  // Final flush to ensure all data is displayed
+  SpreadsheetApp.flush();
+  
   Logger.log(`=== Day-by-Day Fetch Complete ===`);
-  Logger.log(`Days processed: ${daysProcessed}, Errors: ${errorsEncountered}, Total conversions: ${totalFetched}`);
+  Logger.log(`Days processed: ${daysProcessed}, Errors: ${errorsEncountered}`);
+  Logger.log(`Total from API: ${totalFromAPI}, Unique conversions written: ${totalFetched}`);
   
   // Return summary (data already written to sheet)
   return {
@@ -1596,12 +1982,15 @@ function fetchPostHogConversionsByDay(startDate, endDate) {
  * @param {string} endDateStr - End date string for display
  */
 function writeConversionsToSheet(data, startDateStr, endDateStr) {
+  Logger.log(`=== writeConversionsToSheet START ===`);
+  
   // Check if data was already written incrementally (day-by-day fetch)
   if (data.totalWritten !== undefined) {
     Logger.log(`Data already written incrementally: ${data.totalWritten} conversions`);
     return data.totalWritten;
   }
   
+  Logger.log(`Getting spreadsheet...`);
   const ss = SpreadsheetApp.getActiveSpreadsheet();
   let sheet = ss.getSheetByName(CONVERSIONS_SHEET_NAME);
   
@@ -1611,6 +2000,7 @@ function writeConversionsToSheet(data, startDateStr, endDateStr) {
     Logger.log(`Created new sheet: ${CONVERSIONS_SHEET_NAME}`);
   }
   
+  Logger.log(`Got sheet, defining headers...`);
   // Define headers
   const headers = [
     'First Joined At (EST)',
@@ -1622,22 +2012,27 @@ function writeConversionsToSheet(data, startDateStr, endDateStr) {
     'N_CLID',
     'Referring Domain',
     'Initial URL',
-    'Last Updated'
+    'Ref',
+    'Source',
+    'Last Updated',
+    'Conversion Date'  // Column M - just the date portion
   ];
   
-  // Clear only the data rows (faster than clearing large range)
-  const lastRow = sheet.getLastRow();
-  if (lastRow > 1) {
-    sheet.getRange(2, 1, lastRow - 1, headers.length).clearContent();
-  }
+  // DON'T call getLastRow() - sheet may have array formulas expanding to many rows
+  Logger.log(`Checking headers...`);
   
-  // Write headers only if they don't exist
-  if (lastRow === 0 || sheet.getRange(1, 1).getValue() !== headers[0]) {
+  // Write headers only if they don't exist (skip formatting to save time)
+  const firstCell = sheet.getRange(1, 1).getValue();
+  if (firstCell !== headers[0]) {
+    Logger.log(`Writing headers...`);
     sheet.getRange(1, 1, 1, headers.length).setValues([headers]);
-    sheet.getRange(1, 1, 1, headers.length).setFontWeight('bold').setBackground('#4285f4').setFontColor('white');
     sheet.setFrozenRows(1);
+    Logger.log(`Headers written`);
+  } else {
+    Logger.log(`Headers already exist, skipping`);
   }
   
+  Logger.log(`Processing results...`);
   // Process results
   const results = data.results || [];
   const columns = data.columns || [];
@@ -1657,40 +2052,78 @@ function writeConversionsToSheet(data, startDateStr, endDateStr) {
     colIndex[col] = idx;
   });
   
-  // Convert results to rows
+  // Convert results to rows WITH DEDUPLICATION by email
   const rows = [];
+  const seenEmails = new Set();
   const now = new Date();
+  let duplicatesSkipped = 0;
   
   for (let result of results) {
+    const email = result[colIndex['user_email']] || '';
+    
+    // Skip duplicates
+    if (email && seenEmails.has(email)) {
+      duplicatesSkipped++;
+      continue;
+    }
+    
+    // Mark email as seen
+    if (email) {
+      seenEmails.add(email);
+    }
+    
+    // Extract just the date from timestamp_est (e.g., "2025-12-26 00:01:15" -> "2025-12-26")
+    const timestampEst = result[colIndex['timestamp_est']] || '';
+    let conversionDate = '';
+    if (timestampEst) {
+      // Extract date portion (first 10 characters: YYYY-MM-DD)
+      conversionDate = timestampEst.substring(0, 10);
+    }
+    
+    // Format campaign ID as clean number (no decimals, no scientific notation)
+    const rawCampaignId = result[colIndex['campaign_id']] || '';
+    let campaignId = '';
+    if (rawCampaignId !== '') {
+      const num = Number(rawCampaignId);
+      if (!isNaN(num)) {
+        campaignId = String(Math.floor(num)); // Convert to integer string
+      } else {
+        campaignId = String(rawCampaignId).trim();
+      }
+    }
+    
     const row = [
       result[colIndex['first_joined_at']] || '',
-      result[colIndex['timestamp_est']] || '',
-      result[colIndex['user_email']] || '',
-      result[colIndex['campaign_id']] || '',
+      timestampEst,
+      email,
+      campaignId,
       result[colIndex['click_id']] || '',
       result[colIndex['tracker']] || '',
       result[colIndex['n_clid']] || '',
       result[colIndex['initial_referring_domain']] || '',
       result[colIndex['initial_current_url']] || '',
-      now
+      result[colIndex['ref']] || '',
+      result[colIndex['source']] || '',
+      now,
+      conversionDate  // Column M - just the date
     ];
     rows.push(row);
   }
   
+  Logger.log(`Deduplication: ${results.length} raw results → ${rows.length} unique (skipped ${duplicatesSkipped} duplicates)`);
+  
   // Write data in batches to avoid timeout
   if (rows.length > 0) {
-    const BATCH_SIZE = 500;
-    for (let i = 0; i < rows.length; i += BATCH_SIZE) {
-      const batch = rows.slice(i, i + BATCH_SIZE);
-      const startRow = 2 + i;
-      sheet.getRange(startRow, 1, batch.length, headers.length).setValues(batch);
-      Logger.log(`Wrote batch ${Math.floor(i/BATCH_SIZE) + 1}: rows ${startRow} to ${startRow + batch.length - 1}`);
-      
-      // Flush changes to avoid timeout on large writes
-      if (i + BATCH_SIZE < rows.length) {
-        SpreadsheetApp.flush();
-      }
-    }
+    // Clear old data using tracked row count (starts at row 2)
+    clearDataRows(sheet, CONVERSIONS_SHEET_NAME, 2, headers.length, 3000);
+    
+    Logger.log(`Writing ${rows.length} rows in one batch...`);
+    // Write all at once - individual writes are fast, flush is slow
+    sheet.getRange(2, 1, rows.length, headers.length).setValues(rows);
+    Logger.log(`✓ Wrote ${rows.length} rows`);
+    
+    // Save row count for precise clearing later
+    saveRowCount(CONVERSIONS_SHEET_NAME, rows.length);
     
     Logger.log(`Successfully wrote ${rows.length} conversions to sheet`);
   }
@@ -1785,6 +2218,26 @@ function pullConversionsLast7Days() {
     
   } catch (error) {
     Logger.log("Error in pullConversionsLast7Days: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull PostHog conversions for last 7 days INCLUDING today
+ */
+function pullConversionsLast7DaysIncToday() {
+  try {
+    const endDate = getESTDate(); // Today
+    endDate.setHours(23, 59, 59, 999); // End of today
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 6); // 6 days before today = 7 days total
+    startDate.setHours(0, 0, 0, 0);
+    
+    fetchAndWriteConversions(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullConversionsLast7DaysIncToday: " + error.toString());
     SpreadsheetApp.getUi().alert('Error: ' + error.toString());
   }
 }
@@ -1917,9 +2370,11 @@ function pullConversionsCustomRange() {
  */
 function clearConversionData() {
   const ui = SpreadsheetApp.getUi();
+  const rowCount = getRowCount(CONVERSIONS_SHEET_NAME, 3000);
+  
   const result = ui.alert(
     'Clear Conversion Data',
-    'Are you sure you want to clear all PostHog conversion data?',
+    `Are you sure you want to clear ${rowCount} rows of PostHog conversion data?`,
     ui.ButtonSet.YES_NO
   );
   
@@ -1928,11 +2383,8 @@ function clearConversionData() {
     const sheet = ss.getSheetByName(CONVERSIONS_SHEET_NAME);
     
     if (sheet) {
-      const lastRow = sheet.getLastRow();
-      if (lastRow > 1) {
-        sheet.getRange(2, 1, lastRow - 1, 10).clearContent();
-      }
-      ui.alert('Conversion data cleared successfully.');
+      clearDataRows(sheet, CONVERSIONS_SHEET_NAME, 2, 13, 3000);
+      ui.alert(`Conversion data cleared (${rowCount} rows).`);
     } else {
       ui.alert('Conversion data sheet not found.');
     }
@@ -2071,18 +2523,8 @@ function writeRedTrackToSheet(data, startDateStr, endDateStr) {
   
   Logger.log(`Processing ${conversions.length} RedTrack conversion records`);
   
-  // Clear the sheet
-  const lastRow = sheet.getLastRow();
-  const lastCol = sheet.getLastColumn();
-  if (lastRow > 1 && lastCol > 0) {
-    // Clear data rows only (row 2 onwards)
-    sheet.getRange(2, 1, lastRow - 1, lastCol).clearContent();
-  } else if (lastRow === 1) {
-    // Only headers exist, nothing to clear
-  } else if (lastRow > 0) {
-    // Clear everything if structure is unclear
-    sheet.clearContents();
-  }
+  // Clear the sheet using tracked row count
+  clearDataRows(sheet, REDTRACK_SHEET_NAME, 2, 20, 3000);
   
   if (conversions.length === 0) {
     sheet.getRange(1, 1).setValue('No conversions found for the selected date range');
@@ -2127,6 +2569,9 @@ function writeRedTrackToSheet(data, startDateStr, endDateStr) {
     // Auto-resize columns (limit to first 15 to avoid too wide)
     const colsToResize = Math.min(headers.length, 15);
     sheet.autoResizeColumns(1, colsToResize);
+    
+    // Save row count for precise clearing later
+    saveRowCount(REDTRACK_SHEET_NAME, rows.length);
     
     Logger.log(`Successfully wrote ${rows.length} RedTrack conversions to sheet`);
   }
@@ -2219,6 +2664,26 @@ function pullRedTrackLast7Days() {
     
   } catch (error) {
     Logger.log("Error in pullRedTrackLast7Days: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
+ * Pull RedTrack conversions for last 7 days INCLUDING today
+ */
+function pullRedTrackLast7DaysIncToday() {
+  try {
+    const endDate = getESTDate(); // Today
+    endDate.setHours(23, 59, 59, 999); // End of today
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 6); // 6 days before today = 7 days total
+    startDate.setHours(0, 0, 0, 0);
+    
+    fetchAndWriteRedTrack(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullRedTrackLast7DaysIncToday: " + error.toString());
     SpreadsheetApp.getUi().alert('Error: ' + error.toString());
   }
 }
@@ -2505,6 +2970,26 @@ function pullAllDataLast7Days() {
 }
 
 /**
+ * Pull all data sources for last 7 days INCLUDING today
+ */
+function pullAllDataLast7DaysIncToday() {
+  try {
+    const endDate = getESTDate(); // Today
+    endDate.setHours(23, 59, 59, 999); // End of today
+    
+    const startDate = new Date(endDate);
+    startDate.setDate(startDate.getDate() - 6); // 6 days before today = 7 days total
+    startDate.setHours(0, 0, 0, 0);
+    
+    fetchAllData(startDate, endDate);
+    
+  } catch (error) {
+    Logger.log("Error in pullAllDataLast7DaysIncToday: " + error.toString());
+    SpreadsheetApp.getUi().alert('Error: ' + error.toString());
+  }
+}
+
+/**
  * Pull all data for last 30 days
  */
 function pullAllDataLast30Days() {
@@ -2651,10 +3136,7 @@ function clearAllData() {
     try {
       const tjSheet = ss.getSheetByName(SHEET_NAME);
       if (tjSheet) {
-        const lastRow = tjSheet.getLastRow();
-        if (lastRow > 0) {
-          tjSheet.getRange(1, 1, lastRow, 16).clearContent();
-        }
+        clearDataRows(tjSheet, SHEET_NAME, 2, 17, 3000);
         cleared.push('TJ Aggregated Data');
       }
     } catch (e) {
@@ -2665,11 +3147,7 @@ function clearAllData() {
     try {
       const dailySheet = ss.getSheetByName(DAILY_SHEET_NAME);
       if (dailySheet) {
-        const lastRow = dailySheet.getLastRow();
-        if (lastRow > 1) {
-          // Clear only columns A-L (12 columns), preserving headers and formulas beyond
-          dailySheet.getRange(2, 1, lastRow - 1, 12).clearContent();
-        }
+        clearDataRows(dailySheet, DAILY_SHEET_NAME, 3, 12, 5000);
         cleared.push('TJ Daily Breakdown');
       }
     } catch (e) {
@@ -2680,10 +3158,7 @@ function clearAllData() {
     try {
       const phSheet = ss.getSheetByName(CONVERSIONS_SHEET_NAME);
       if (phSheet) {
-        const lastRow = phSheet.getLastRow();
-        if (lastRow > 1) {
-          phSheet.getRange(2, 1, lastRow - 1, 10).clearContent();
-        }
+        clearDataRows(phSheet, CONVERSIONS_SHEET_NAME, 2, 13, 3000);
         cleared.push('PostHog Conversions');
       }
     } catch (e) {
@@ -2694,11 +3169,7 @@ function clearAllData() {
     try {
       const rtSheet = ss.getSheetByName(REDTRACK_SHEET_NAME);
       if (rtSheet) {
-        const lastRow = rtSheet.getLastRow();
-        const lastCol = rtSheet.getLastColumn();
-        if (lastRow > 1 && lastCol > 0) {
-          rtSheet.getRange(2, 1, lastRow - 1, lastCol).clearContent();
-        }
+        clearDataRows(rtSheet, REDTRACK_SHEET_NAME, 2, 20, 3000);
         cleared.push('RedTrack Conversions');
       }
     } catch (e) {
@@ -2720,5 +3191,3 @@ function clearAllData() {
     ui.alert('Clear All Data', message, ui.ButtonSet.OK);
   }
 }
-
-
